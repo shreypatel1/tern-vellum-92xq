@@ -131,6 +131,39 @@ def check_opt(cls, i):
             raise
         return False
 
+
+_MCONN = {}
+
+
+def mconn(which):
+    """A DuckDB connection with the TPC tables materialized (single thread), and the fixture pairs."""
+    if which not in _MCONN:
+        import duckdb
+        import tests.test_executor as T
+        from tests.helpers import load_sql_fixture_pairs
+        schema = T.TPCH_SCHEMA if which == "tpch" else T.TPCDS_SCHEMA
+        d = T.DIR_TPCH if which == "tpch" else T.DIR_TPCDS
+        conn = duckdb.connect()
+        conn.execute("SET threads=1")
+        for table, columns in schema.items():
+            conn.execute(
+                f"CREATE TABLE {table} AS SELECT * FROM READ_CSV('{d}{table}.csv.gz', delim='|', header=True, columns={columns})")
+        fx = "optimizer/tpc-h/tpc-h.sql" if which == "tpch" else "optimizer/tpc-ds/tpc-ds.sql"
+        _MCONN[which] = (conn, list(load_sql_fixture_pairs(fx)))
+    return _MCONN[which]
+
+
+def mhash(conn, which, kind, i, sqls):
+    """Result hash of transpile(sql or optimized, duckdb) for query i on the materialized tables."""
+    from sqlglot import transpile
+    _, sql, optimized = sqls[i]
+    try:
+        return df_hash(conn.execute(transpile(sql if kind == "sql" else optimized, write="duckdb")[0]).fetchdf())
+    except BaseException as ex:  # noqa
+        if ex.__class__.__name__ == "_Timeout":
+            raise
+        return "ERR:" + ex.__class__.__name__
+
 if __name__ == "__main__":
     import json
     repo = sys.argv[1]

@@ -204,15 +204,36 @@ def _arm(t0, budget, cap=None):
     signal.setitimer(signal.ITIMER_REAL, min(left, cap if cap is not None else left) + 0.3)
 
 
+_TPCDUCK = []
+
+
+def _tpcduck(ix):
+    """Pinned DuckDB result hashes on materialized tables, kept only where they equal the hashes
+    the test's own CSV views gave (so equality on the tables stands for equality on the views)."""
+    if not _TPCDUCK:
+        m = {}
+        try:
+            m = json.load(open(os.path.join(HERE, "tpcduck.json")))
+        except Exception:  # noqa
+            pass
+        dres = ix.tpcres.get("duck", {})
+        _TPCDUCK.append({k: {i: h for i, h in v.items() if not h.startswith("ERR")
+                             and (dres.get(k, {}).get(i) or [None])[0] == h} for k, v in m.items()})
+    return _TPCDUCK[0]
+
+
 def fp_failures(fp_ids, ch, ix):
     """Decide the TPC executor tests without running them whole.
 
-    Fingerprint the queries the change reaches (parsed+pickled expression, optimized expression,
-    DuckDB transpilations). Queries the test does not execute can only fail by raising while
-    being parsed/pickled. Executed queries whose optimized form moved (or whose Python execution
-    path changed) are executed with the patched code right away and their result compared to the
-    pinned commit's result, which the unpatched test proves equal to DuckDB's. The first mismatch
-    stops the work, and so does spending more CPU than scheduling the test would save."""
+    Pass 1 fingerprints the queries the change reaches (parsed+pickled expression, optimized
+    expression, DuckDB transpilations). Queries the test does not execute can only fail by raising
+    while being parsed/pickled. For an executed query whose transpilation moved, DuckDB runs it on
+    materialized copies of the tables (milliseconds, against the CSV views' ~0.2 s): the same
+    result as at the pinned commit settles the DuckDB side. Queries whose optimized form moved (or
+    whose Python execution path changed), or whose DuckDB side is not settled, are then re-run the
+    test's own way (Python result vs the pinned result, else assert_frame_equal against DuckDB),
+    cheapest first. The first failure stops the work, and so does spending more CPU than
+    scheduling the test would save."""
     import signal
     import harness
     import tpcfp
@@ -220,6 +241,7 @@ def fp_failures(fp_ids, ch, ix):
     bad = set()
     cache = {}
     loaded = []
+    mb = _tpcduck(ix)
     prev = signal.signal(signal.SIGALRM, harness._alarm)
     try:
         for tid in fp_ids:
@@ -234,6 +256,7 @@ def fp_failures(fp_ids, ch, ix):
             dres = ix.tpcres.get("duck", {})
             phase_b = ch.fp_phase_b(tid)
             execq = {int(i) for i, v in res.items() if v[0] != "NONE"}
+            n_rel = len(idxs) if mode == "opt" else max(1, len(idxs & execq))
 
             def _c(m, i):
                 v = m.get(str(i)) or m.get(i)
@@ -244,6 +267,20 @@ def fp_failures(fp_ids, ch, ix):
                     now.update(tpcfp.fingerprints(which, {i}))
                 return now.get(i)
 
+            def _cost(j, duck_same=False):
+                # a re-run of subtest j; DuckDB on the CSV views only when its side is not settled
+                if mode == "opt":
+                    return FP_SCALE * (_c(dres.get(f"{which}:sql", {}), j) + _c(dres.get(f"{which}:opt", {}), j))
+                return FP_SCALE * (_c(res, j) + (0 if duck_same else _c(dres.get(f"{which}:sql", {}), j)))
+
+            def msame(kind, j):
+                # DuckDB result of the patched transpilation on materialized tables == pinned
+                base = mb.get(f"{which}:{kind}", {}).get(str(j))
+                if base is None:
+                    return False
+                conn, sqls = tpcres.mconn(which)
+                return tpcres.mhash(conn, which, kind, j, sqls) == base
+
             t0 = _proc_cpu()
             budget = FP_EXEC_BUDGET
             fail = False
@@ -251,19 +288,13 @@ def fp_failures(fp_ids, ch, ix):
             n_exec = n_duck = 0
             try:
                 order = sorted(idxs)
-                n_rel = len(idxs) if mode == "opt" else max(1, len(idxs & execq))
                 _arm(t0, budget)
                 fpr(order[0])
                 if len(tpcfp._PAIRS.get(which, ())) != len(ref):
                     fail, why = True, "pairs"  # queries added/removed in the fixture
-                # pass 1: fingerprint every reached query (cheap) and collect the subtests to re-run
-                todo = []
+                # pass 1: fingerprint every reached query; settle DuckDB-side changes cheaply
+                todo = []  # (query, python side unchanged, DuckDB side unchanged)
                 seen = 0
-
-                def _cost(j, same):
-                    if mode == "opt":
-                        return FP_SCALE * (_c(dres.get(f"{which}:sql", {}), j) + _c(dres.get(f"{which}:opt", {}), j))
-                    return FP_SCALE * (_c(res, j) + (0 if same else _c(dres.get(f"{which}:sql", {}), j)))
                 for i in ([] if fail else order):
                     r = ref.get(str(i)) or ref.get(i)
                     _arm(t0, budget)
@@ -273,42 +304,49 @@ def fp_failures(fp_ids, ch, ix):
                     if len(n) > 3 and mode == "exec" and bool(n[3]) != (i in execq):
                         fail, why = True, "flag"; break  # fixture flipped the query's execute flag
                     if mode == "opt":
-                        if n[1] != r[1] or n[2] != r[2]:
-                            todo.append((i, None))
                         seen += 1
-                        continue
-                    if i not in execq:
-                        # never compared: only an exception while parsing/pickling can fail it
-                        if n[0].startswith("ERR") and n[0] != r[0]:
+                        if n[1] == r[1] and n[2] == r[2]:
+                            continue
+                        n_duck += 1
+                        if not ((n[1] == r[1] or msame("sql", i)) and (n[2] == r[2] or msame("opt", i))):
+                            todo.append((i, False, False))
+                    else:
+                        if i not in execq:
+                            # never compared: only an exception while parsing/pickling can fail it
+                            if n[0].startswith("ERR") and n[0] != r[0]:
+                                fail, why = True, "err"; break
+                            continue
+                        if n[0].startswith("ERR"):
                             fail, why = True, "err"; break
-                        continue
-                    if n[0].startswith("ERR"):
-                        fail, why = True, "err"; break
-                    if n[0] != r[0] or n[1] != r[1] or phase_b:
-                        todo.append((i, n[1] == r[1]))
-                    seen += 1
+                        seen += 1
+                        py_same = n[0] == r[0] and not phase_b
+                        duck_same = n[1] == r[1]
+                        if not duck_same:
+                            n_duck += 1
+                            duck_same = msame("sql", i)
+                        if not (py_same and duck_same):
+                            todo.append((i, py_same, duck_same))
                     if seen >= 10 and todo:
                         # on track to blow the budget: stop fingerprinting now
-                        sofar = sum(_cost(j, same) for j, same in todo)
+                        sofar = sum(_cost(j, d) for j, _, d in todo)
                         if (_proc_cpu() - t0) * n_rel / seen + FP_LOAD + sofar * n_rel / seen > budget:
                             fail, why = True, "proj"; break
-                # cheapest re-checks first: more subtests settled per CPU second
-                todo.sort(key=lambda t: _cost(*t))
+                # cheapest re-runs first: more subtests settled per CPU second
+                todo.sort(key=lambda t: _cost(t[0], t[2]))
                 if not fail and todo:
-                    est = sum(_cost(i, same) for i, same in todo) + (0 if loaded else FP_LOAD)
+                    est = sum(_cost(i, d) for i, _, d in todo) + (0 if loaded else FP_LOAD)
                     if (_proc_cpu() - t0) + est > budget:
                         fail, why = True, f"est{est:.1f}"
-                # pass 2: re-run the subtests the test's own way, cheapest first; first failure stops
-                for i, same in ([] if fail else todo):
+                # pass 2: re-run the remaining subtests the test's own way; first failure stops
+                for i, py_same, duck_same in ([] if fail else todo):
                     if not loaded:
                         loaded.append(tpcres.load())
-                    _arm(t0, budget, 3 * _cost(i, same) + 1.0)
+                    _arm(t0, budget, 3 * _cost(i, duck_same) + 1.0)
                     if mode == "opt":
-                        n_duck += 1
                         ok = tpcres.check_opt(loaded[0], i)
                     else:
                         n_exec += 1
-                        ok = tpcres.check_exec(loaded[0], which, i, (res.get(str(i)) or res.get(i))[0], same)
+                        ok = tpcres.check_exec(loaded[0], which, i, (res.get(str(i)) or res.get(i))[0], duck_same)
                     if not ok:
                         fail, why = True, "result"; break
             except BaseException as e:  # noqa
@@ -324,24 +362,20 @@ def fp_failures(fp_ids, ch, ix):
     return bad
 
 
-def state_diff(ch):
-    """Import everything with the patched sources in a child; return the module-state keys
-    that differ from the pinned commit's (None if unknown)."""
-    base = getattr(ch.ix, "state", None)
-    if not base or not base.get("snap"):
-        return None
-    mods = None
-    if not ch.itime:
-        # only module/class-level assignments changed: just the changed modules and the modules
-        # that (transitively) import them can hold different state
-        todo = [p for p in ch.diffpaths]
-        seen = set(todo)
-        while todo:
-            p = todo.pop()
-            for imp in ch.ix.imports.get(p, []):
-                if imp not in seen:
-                    seen.add(imp); todo.append(imp)
-        mods = {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
+def _closure(ch, paths):
+    """sqlglot module names of paths and of every module that (transitively) imports them."""
+    todo = list(paths)
+    seen = set(todo)
+    while todo:
+        p = todo.pop()
+        for imp in ch.ix.imports.get(p, []):
+            if imp not in seen:
+                seen.add(imp); todo.append(imp)
+    return {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
+
+
+def _in_child(fn):
+    """Run fn() in a forked child; return its JSON result (None if it crashed)."""
     r, w = os.pipe()
     sys.stdout.flush(); sys.stderr.flush()
     pid = os.fork()
@@ -351,28 +385,7 @@ def state_diff(ch):
             os.dup2(2, 1)
             import signal
             signal.alarm(30)
-            srcs = {}
-            for p, t in ch.new_sources.items():
-                if p.endswith(".py"):
-                    srcs[modname(p)] = (os.path.join(REPO, p), t)
-            for m in list(sys.modules):
-                if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."):
-                    del sys.modules[m]
-            sys.meta_path.insert(0, PatchedFinder(srcs))
-            os.environ["SKIP_INTEGRATION"] = "0"
-            os.chdir(REPO)
-            import state
-            if mods is None:
-                bad = state.import_everything(REPO)
-                snap = state.snapshot()
-            else:
-                import importlib
-                bad = list(base["bad"])
-                for m in sorted(mods):
-                    importlib.import_module(m)  # an import error -> no output -> unknown
-                state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
-                snap = state.snapshot(mods=mods)
-            b = json.dumps({"bad": bad, "snap": snap}).encode()
+            b = json.dumps(fn()).encode()
             while b:
                 n = os.write(w, b); b = b[n:]
         except BaseException:  # noqa
@@ -393,8 +406,124 @@ def state_diff(ch):
     global ITIME_CPU
     ITIME_CPU += ru.ru_utime + ru.ru_stime
     try:
-        d = json.loads(b"".join(chunks))
+        return json.loads(b"".join(chunks))
     except Exception:
+        return None
+
+
+def _patched_finder(ch, drop):
+    srcs = {}
+    for p, t in ch.new_sources.items():
+        if p.endswith(".py"):
+            srcs[modname(p)] = (os.path.join(REPO, p), t)
+    for m in list(sys.modules):
+        if drop(m):
+            del sys.modules[m]
+    sys.meta_path.insert(0, PatchedFinder(srcs))
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.chdir(REPO)
+
+
+def import_check(ch):
+    """Import every test module (in pytest's collection order) and then every sqlglot module
+    with the patched sources, in a child. True if the same modules import as at the pinned
+    commit; otherwise False, with ch.newly_bad naming the ones that no longer do (None if the
+    child crashed). Order matters: a class body that builds expressions at import time
+    (templates parsed in a generator) can break the import of the first test module to load it."""
+    base = getattr(ch.ix, "state", None)
+    if not base or "bad" not in base:
+        return False
+    mods = _closure(ch, ch.reimport)
+    # one dialect's own modules: everything else stays as the parent imported it
+    keep = all(_dialect_family(m) for m in mods)
+    preimport_all()
+
+    def child():
+        _patched_finder(ch, lambda m: m == "tests" or m.startswith("tests.") or (
+            (m == "sqlglot" or m.startswith("sqlglot.")) and (not keep or m in mods)))
+        return import_pytest_order(REPO)
+    bad = _in_child(child)
+    if bad is None:
+        return False
+    if sorted(bad) != sorted(base["bad"]):
+        ch.newly_bad = set(bad) - set(base["bad"])
+        return False
+    return True
+
+
+def import_pytest_order(repo):
+    import importlib
+    import pkgutil
+    bad = []
+    tests = []
+
+    def walk(d):
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if os.path.isdir(p):
+                if name not in ("__pycache__", "fixtures"):
+                    walk(p)
+            elif name.startswith("test_") and name.endswith(".py"):
+                tests.append(os.path.relpath(p, repo)[:-3].replace(os.sep, "."))
+    walk(os.path.join(repo, "tests"))
+    for m in tests:
+        try:
+            importlib.import_module(m)
+        except BaseException:
+            bad.append(m)
+    import sqlglot
+    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if m.name.endswith("__main__") or m.name in sys.modules:
+            continue
+        try:
+            importlib.import_module(m.name)
+        except Exception:
+            bad.append(m.name)
+    # the rest of tests/ (helpers and modules pytest does not collect), as state.py does
+    for root, _, files in os.walk(os.path.join(repo, "tests")):
+        for f in sorted(files):
+            if f.endswith(".py"):
+                rel = os.path.relpath(os.path.join(root, f), repo)[:-3].replace(os.sep, ".")
+                if rel.endswith("__init__"):
+                    rel = rel[:-9]
+                if rel in sys.modules or rel in bad:
+                    continue
+                try:
+                    importlib.import_module(rel)
+                except BaseException:
+                    bad.append(rel)
+    return bad
+
+
+def state_diff(ch):
+    """Import everything with the patched sources in a child; return the module-state keys
+    that differ from the pinned commit's (None if unknown)."""
+    base = getattr(ch.ix, "state", None)
+    if not base or not base.get("snap"):
+        return None
+    mods = None
+    if not ch.itime and not ch.full_diff:
+        # only module/class-level assignments changed: just the changed modules and the modules
+        # that (transitively) import them can hold different state
+        mods = _closure(ch, ch.diffpaths)
+    preimport_all()
+
+    def child():
+        _patched_finder(ch, lambda m: m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."))
+        import state
+        if mods is None:
+            bad = state.import_everything(REPO)
+            snap = state.snapshot()
+        else:
+            import importlib
+            bad = list(base["bad"])
+            for m in sorted(mods):
+                importlib.import_module(m)  # an import error -> no output -> unknown
+            state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
+            snap = state.snapshot(mods=mods)
+        return {"bad": bad, "snap": snap}
+    d = _in_child(child)
+    if d is None:
         return None
     if sorted(d["bad"]) != sorted(base["bad"]):
         return None
@@ -404,11 +533,86 @@ def state_diff(ch):
         # only what this partial import produced: lazily created package attributes (PEP 562)
         # and submodules nobody imported here are absent, not changed
         old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods and k in new}
-    return sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+    keys = sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+    if ch.full_diff and not ch.itime:
+        # a module global that only the patched import binds (e.g. names imported under a
+        # flipped TYPE_CHECKING guard): the pinned code ran without it, so no code the tests ran
+        # looked it up. Class attributes still count (they shadow inherited ones).
+        added = [k for k in keys if k not in old and "." not in k.split(":", 1)[1]]
+        if added:
+            ch.notes.append(f"new globals ignored {added[:4]}")
+            keys = [k for k in keys if k not in set(added)]
+    return keys
 
 
 ITIME_CPU = 0.0
-ALL_COST = 0.0
+_PREIMPORTED = []
+
+
+def _dialect_family(m):
+    parts = m.split(".")
+    return (len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "generators", "parsers", "typing")
+            and parts[2] not in ("dialect", "base"))
+
+
+def preimport_all():
+    """Import every sqlglot and test module once in the parent (pytest order), so a patched
+    import in a child only redoes the modules a change can reach."""
+    if _PREIMPORTED:
+        return
+    _PREIMPORTED.append(1)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    cwd = os.getcwd()
+    os.chdir(REPO)
+    try:
+        import state
+        state.import_everything(REPO)
+    except Exception:  # noqa
+        pass
+    finally:
+        os.chdir(cwd)
+
+
+# Tests whose cost is input size, checked on a scaled-down copy (same code paths, same ratio of
+# input size to node limit): a failure of the copy schedules the real test.
+# (test id, file the copy is taken from, [(old, new) source edits], cpu of the copy, timeout)
+SHRINK = {
+    "tests/test_parser.py::TestParser::test_max_nodes": (
+        "tests/test_parser.py",
+        [("width = 10000", "width = 100"),
+         ("parse_one(sql, max_nodes=1_000_000)\n", "parse_one(sql, max_nodes=10_000)\n"),
+         ("max_nodes=50_000", "max_nodes=500"),
+         ('"(50000)"', '"(500)"')],
+        0.3, 5.0),
+}
+
+
+# checked (not scheduled blind) even when a change reaches everything
+UNKNOWN_TRY = list(SHRINK) + ["tests/test_generator.py::TestGenerator::test_generator_memory"]
+
+
+def shrink_ok(ch, tid):
+    """The scaled-down copy can stand in for tid under this change."""
+    return tid in SHRINK and not any(fp.path == SHRINK[tid][0] for fp in ch.files)
+
+
+def install_shrunk(tid):
+    """Replace the test method with its scaled-down copy (in the child, after imports)."""
+    import harness
+    import inspect
+    import textwrap
+    cls, meth = harness.get_class(tid)
+    fn = getattr(cls, meth)
+    src = textwrap.dedent(inspect.getsource(fn))
+    for a, b in SHRINK[tid][1]:
+        if src.count(a) != 1:
+            return False
+        src = src.replace(a, b)
+    mod = sys.modules[cls.__module__]
+    ns = {}
+    exec(compile(src, mod.__file__, "exec"), vars(mod), ns)
+    setattr(cls, meth, ns[fn.__name__])
+    return True
 
 
 def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None):
@@ -444,6 +648,15 @@ def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None
         failed = set()
         if fp_ids:
             failed |= fp_failures(fp_ids, ch, ix)
+        for tid in run_ids:
+            if tid in SHRINK:
+                try:
+                    if not install_shrunk(tid):
+                        failed.add(tid)
+                        run_ids = [t for t in run_ids if t != tid]
+                except Exception:  # noqa
+                    failed.add(tid)
+                    run_ids = [t for t in run_ids if t != tid]
         failed |= harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
         os.write(wfd, json.dumps(sorted(failed)).encode())
     except BaseException as e:  # noqa
@@ -542,6 +755,11 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
     S = [p for p in S if p not in set(fpc)]
     if not S:
         return [], [], "empty" if not fpc else "fp-only", []
+    if any(ix.ids[p] in SHRINK for p in S):
+        per = list(per)
+        for p in S:
+            if ix.ids[p] in SHRINK and shrink_ok(ch, ix.ids[p]):
+                per[p] = SHRINK[ix.ids[p]][2]
     forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail]
     runnable = [p for p in S if p not in set(forced)]
     py_changed = bool(ch.swap or ch.reimport)
@@ -630,6 +848,11 @@ def main():
                 # the changed code already runs in most tests: schedule everything, skip the checks
                 ch.unknown = True
                 ch.notes.append("broad import-time change -> all tests")
+            if ch.reimport and not ch.unknown and not import_check(ch):
+                if not ch.import_fail_reach(ch.it_fallback | ch.diff_fallback):
+                    ch.unknown = True
+                    ch.import_broken = True
+                    ch.notes.append("patched import fails -> all tests")
             if (ch.itime or ch.diffpaths) and not ch.unknown:
                 ch.apply_itime(state_diff(ch))
         except Exception as e:  # noqa
@@ -674,11 +897,22 @@ def main():
     log(f"setup cpu {time.process_time() - T0:.2f}s")
 
     all_nums = sorted(ms)
-    global ALL_COST
-    ALL_COST = pack_cost(ms)
+    full = {n: ms[n] for n in all_nums}
+    full_cost = pack_cost(full)
     for cid, ch, run, blind, label, onfail in jobs:
         if run is None:
             sel = {n: ms[n] for n in all_nums}
+            if ch is not None and ch.reimport and not ch.syntax_error and not ch.odd and not ch.import_broken:
+                # every test is scheduled; the costliest ones that have a cheap stand-in are
+                # checked with the patched import instead, and dropped if they pass
+                try_ids = [t for t in UNKNOWN_TRY if t in num_of and (t not in SHRINK or shrink_ok(ch, t))]
+                tmo = {t: SHRINK[t][3] if t in SHRINK else 20.0 for t in try_ids}
+                res, status = run_in_fork(ch, try_ids, funcs_by_file, tmo, (), ix)
+                if res is not None:
+                    for t in try_ids:
+                        if t not in res:
+                            sel.pop(num_of[t], None)
+                log(cid, f"unknown: checked {len(try_ids)} status={status} failed={None if res is None else len(res)} cpu={LAST_CPU:.2f}")
             log(cid, "UNKNOWN -> all tests", ch.notes if ch else "")
         else:
             failed_pos = set()
@@ -687,7 +921,7 @@ def main():
             fpc = getattr(ch, "fpcheck", []) if ch is not None else []
             if run or fpc:
                 rid = [ix.ids[p] for p in run]
-                tmo = {ix.ids[p]: max(2.0, 10 * ix.cpu[p]) for p in run}
+                tmo = {ix.ids[p]: SHRINK[ix.ids[p]][3] if ix.ids[p] in SHRINK else max(2.0, 10 * ix.cpu[p]) for p in run}
                 res, status = run_in_fork(ch, rid, funcs_by_file, tmo, [ix.ids[p] for p in fpc], ix)
                 cpu = LAST_CPU
                 allp = list(run) + list(fpc)
@@ -697,10 +931,8 @@ def main():
                 sel_pos |= set(onfail)
             sel = {pos2num[p]: ms[pos2num[p]] for p in sel_pos}
             log(cid, f"{label} fp={len(fpc)} run={len(run)} blind={len(blind)} failed={len(failed_pos)} status={status} cpu={cpu:.2f} notes={ch.notes}")
-            if sel and len(sel) < len(all_nums) and pack_cost(sel) >= ALL_COST - 1e-9:
-                # scheduling every test costs no more than this selection: free insurance
-                sel = {n: ms[n] for n in all_nums}
-                log(cid, "selection already costs as much as all tests -> all tests")
+        if sel and len(sel) < len(all_nums) and full_cost <= pack_cost(sel):
+            sel = full  # running everything costs no more: free insurance against a miss
         print(json.dumps({"commit": cid, "workers": pack(sel)}), flush=True)
     log(f"total cpu (parent) {time.process_time() - T0:.2f}s")
 
