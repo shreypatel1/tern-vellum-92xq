@@ -522,10 +522,28 @@ def equivalent_units(info):
     return need or True
 
 
+def _stmts_near(tree, lo, hi):
+    """Statements whose full span overlaps [lo, hi]; skips subtrees outside the range."""
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            s = getattr(child, "lineno", None)
+            if s is not None:
+                e = getattr(child, "end_lineno", None) or s
+                if e < lo or s > hi:
+                    continue
+            if isinstance(child, ast.stmt):
+                yield child
+            stack.append(child)
+
+
 def stmt_spans_tree(tree, lines):
     spans = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.stmt):
+    if not lines:
+        return set()
+    for node in _stmts_near(tree, min(lines), max(lines)):
+        if True:
             start = node.lineno
             body = getattr(node, "body", None)
             full_end = node.end_lineno or start
