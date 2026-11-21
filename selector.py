@@ -183,6 +183,25 @@ FP_TESTS = {
 
 FP_MIN_GAIN = float(os.environ.get("BR_FP_MIN_GAIN", "3.0"))
 FP_EXEC_BUDGET = float(os.environ.get("BR_FP_EXEC", "13.0"))
+# recorded per-query costs (map build) over what a re-check costs here
+FP_SCALE = float(os.environ.get("BR_FP_SCALE", "0.75"))
+FP_LOAD = 2.5  # executor test class setup (tables + DuckDB views)
+
+
+def _proc_cpu():
+    import resource
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_utime + r.ru_stime
+
+
+def _arm(t0, budget, cap=None):
+    """Stop the current step once the CPU budget is spent, or after `cap` seconds (a query that
+    runs far longer than recorded will not pay off)."""
+    import signal
+    left = budget - (_proc_cpu() - t0)
+    if left <= 0:
+        raise RuntimeError("budget")
+    signal.setitimer(signal.ITIMER_REAL, min(left, cap if cap is not None else left) + 0.3)
 
 
 def fp_failures(fp_ids, ch, ix):
@@ -191,103 +210,117 @@ def fp_failures(fp_ids, ch, ix):
     Fingerprint the queries the change reaches (parsed+pickled expression, optimized expression,
     DuckDB transpilations). Queries the test does not execute can only fail by raising while
     being parsed/pickled. Executed queries whose optimized form moved (or whose Python execution
-    path changed) are executed with the patched code and their result compared to the pinned
-    commit's result, which the unpatched test proves equal to DuckDB's."""
+    path changed) are executed with the patched code right away and their result compared to the
+    pinned commit's result, which the unpatched test proves equal to DuckDB's. The first mismatch
+    stops the work, and so does spending more CPU than scheduling the test would save."""
+    import signal
+    import harness
     import tpcfp
+    import tpcres
     bad = set()
     cache = {}
     loaded = []
-    for tid in fp_ids:
-        which, mode = FP_TESTS[tid]
-        q = ch.fp_queries(tid)
-        ref = ix.tpcfp.get(which, {})
-        idxs = {int(i) for i in ref} if q is None else q
-        if not idxs:
-            continue
-        now = cache.setdefault(which, {})
-
-        def fpr(i):
-            # fingerprint lazily, one query at a time, so a failing query stops the work early
-            if i not in now:
-                now.update(tpcfp.fingerprints(which, {i}))
-            return now.get(i)
-        fpr(min(idxs))
-        if len(tpcfp._PAIRS.get(which, ())) != len(ref):
-            bad.add(tid); continue  # queries added/removed in the fixture
-        res = ix.tpcres.get(which, {})
-        dres = ix.tpcres.get("duck", {})
-        phase_b = ch.fp_phase_b(tid)
-        execq = {int(i) for i, v in res.items() if v[0] != "NONE"}
-        to_exec = set()
-        to_duck = set()  # (kind, i)
-
-        def _c(m, i):
-            v = m.get(str(i)) or m.get(i)
-            return v[1] if v else 1.0
-        fail = False
-        checked = 0
-        for i in sorted(idxs):
-            r = ref.get(str(i)) or ref.get(i)
-            n = fpr(i)
-            if r is None or n is None:
-                fail = True; break
-            if len(n) > 3 and mode == "exec" and bool(n[3]) != (i in execq):
-                fail = True; break  # fixture flipped the query's execute flag
-            if mode == "opt":
-                if n[1] != r[1]:
-                    to_duck.add(("sql", i))
-                if n[2] != r[2]:
-                    to_duck.add(("opt", i))
+    prev = signal.signal(signal.SIGALRM, harness._alarm)
+    try:
+        for tid in fp_ids:
+            which, mode = FP_TESTS[tid]
+            q = ch.fp_queries(tid)
+            ref = ix.tpcfp.get(which, {})
+            idxs = {int(i) for i in ref} if q is None else q
+            if not idxs:
                 continue
-            if i not in execq:
-                # never compared: only an exception while parsing/pickling can fail it
-                if n[0].startswith("ERR") and n[0] != r[0]:
-                    fail = True; break
-                continue
-            if n[0].startswith("ERR"):
-                fail = True; break
-            if n[1] != r[1]:
-                to_duck.add(("sql", i))
-            if n[0] != r[0] or phase_b:
-                to_exec.add(i)
-            checked += 1
-            spent = sum(_c(res, j) for j in to_exec) + sum(_c(dres.get(f"{which}:{k}", {}), j) for k, j in to_duck)
-            if 2.5 + spent > FP_EXEC_BUDGET:
-                fail = True; break  # re-checking would cost more than scheduling the test
-            if checked >= 8 and 2.5 + spent * len(idxs) / checked > 1.5 * FP_EXEC_BUDGET:
-                fail = True; break  # on track to blow the budget: stop fingerprinting now
-        print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} exec={len(to_exec)} duck={len(to_duck)} fail={fail} phaseB={phase_b}", file=sys.stderr)
-        if fail:
-            bad.add(tid); continue
-        if not to_exec and not to_duck:
-            continue
+            now = cache.setdefault(which, {})
+            res = ix.tpcres.get(which, {})
+            dres = ix.tpcres.get("duck", {})
+            phase_b = ch.fp_phase_b(tid)
+            execq = {int(i) for i, v in res.items() if v[0] != "NONE"}
 
-        est = 2.5 + sum(_c(res, i) for i in to_exec) + sum(_c(dres.get(f"{which}:{k}", {}), i) for k, i in to_duck)
-        if est > FP_EXEC_BUDGET:
-            bad.add(tid); continue
-        import signal
-        import harness
-        prev = signal.signal(signal.SIGALRM, harness._alarm)
-        try:
-            signal.setitimer(signal.ITIMER_REAL, 3 * FP_EXEC_BUDGET)
-            import tpcres
-            if not loaded:
-                loaded.append(tpcres.load())
-            got = tpcres.run(loaded[0], which, to_exec) if to_exec else {}
-            ok = all(h == (res.get(str(i)) or res.get(i))[0] for i, (h, _) in got.items())
-            for kind in ("sql", "opt"):
-                idk = {i for k, i in to_duck if k == kind}
-                if ok and idk:
-                    base = dres.get(f"{which}:{kind}", {})
-                    dg = tpcres.duck(loaded[0], which, kind, idk)
-                    ok = all(base.get(str(i)) and h == base[str(i)][0] and not h.startswith("ERR") for i, (h, _) in dg.items())
-            if not ok:
+            def _c(m, i):
+                v = m.get(str(i)) or m.get(i)
+                return v[1] if v else 1.0
+
+            def fpr(i):
+                if i not in now:
+                    now.update(tpcfp.fingerprints(which, {i}))
+                return now.get(i)
+
+            t0 = _proc_cpu()
+            budget = FP_EXEC_BUDGET
+            fail = False
+            why = ""
+            n_exec = n_duck = 0
+            try:
+                order = sorted(idxs)
+                n_rel = len(idxs) if mode == "opt" else max(1, len(idxs & execq))
+                _arm(t0, budget)
+                fpr(order[0])
+                if len(tpcfp._PAIRS.get(which, ())) != len(ref):
+                    fail, why = True, "pairs"  # queries added/removed in the fixture
+                # pass 1: fingerprint every reached query (cheap) and collect the subtests to re-run
+                todo = []
+                seen = 0
+
+                def _cost(j, same):
+                    if mode == "opt":
+                        return FP_SCALE * (_c(dres.get(f"{which}:sql", {}), j) + _c(dres.get(f"{which}:opt", {}), j))
+                    return FP_SCALE * (_c(res, j) + (0 if same else _c(dres.get(f"{which}:sql", {}), j)))
+                for i in ([] if fail else order):
+                    r = ref.get(str(i)) or ref.get(i)
+                    _arm(t0, budget)
+                    n = fpr(i)
+                    if r is None or n is None:
+                        fail, why = True, "nofp"; break
+                    if len(n) > 3 and mode == "exec" and bool(n[3]) != (i in execq):
+                        fail, why = True, "flag"; break  # fixture flipped the query's execute flag
+                    if mode == "opt":
+                        if n[1] != r[1] or n[2] != r[2]:
+                            todo.append((i, None))
+                        seen += 1
+                        continue
+                    if i not in execq:
+                        # never compared: only an exception while parsing/pickling can fail it
+                        if n[0].startswith("ERR") and n[0] != r[0]:
+                            fail, why = True, "err"; break
+                        continue
+                    if n[0].startswith("ERR"):
+                        fail, why = True, "err"; break
+                    if n[0] != r[0] or n[1] != r[1] or phase_b:
+                        todo.append((i, n[1] == r[1]))
+                    seen += 1
+                    if seen >= 10 and todo:
+                        # on track to blow the budget: stop fingerprinting now
+                        sofar = sum(_cost(j, same) for j, same in todo)
+                        if (_proc_cpu() - t0) * n_rel / seen + FP_LOAD + sofar * n_rel / seen > budget:
+                            fail, why = True, "proj"; break
+                # cheapest re-checks first: more subtests settled per CPU second
+                todo.sort(key=lambda t: _cost(*t))
+                if not fail and todo:
+                    est = sum(_cost(i, same) for i, same in todo) + (0 if loaded else FP_LOAD)
+                    if (_proc_cpu() - t0) + est > budget:
+                        fail, why = True, f"est{est:.1f}"
+                # pass 2: re-run the subtests the test's own way, cheapest first; first failure stops
+                for i, same in ([] if fail else todo):
+                    if not loaded:
+                        loaded.append(tpcres.load())
+                    _arm(t0, budget, 3 * _cost(i, same) + 1.0)
+                    if mode == "opt":
+                        n_duck += 1
+                        ok = tpcres.check_opt(loaded[0], i)
+                    else:
+                        n_exec += 1
+                        ok = tpcres.check_exec(loaded[0], which, i, (res.get(str(i)) or res.get(i))[0], same)
+                    if not ok:
+                        fail, why = True, "result"; break
+            except BaseException as e:  # noqa
+                fail, why = True, "budget" if (e.__class__.__name__ == "_Timeout" or str(e) == "budget") else "crash"
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} exec={n_exec} duck={n_duck} fail={fail} {why} "
+                  f"phaseB={phase_b} cpu={_proc_cpu() - t0:.2f}", file=sys.stderr)
+            if fail:
                 bad.add(tid)
-        except BaseException:  # noqa
-            bad.add(tid)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, prev)
+    finally:
+        signal.signal(signal.SIGALRM, prev)
     return bad
 
 
@@ -375,6 +408,7 @@ def state_diff(ch):
 
 
 ITIME_CPU = 0.0
+ALL_COST = 0.0
 
 
 def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None):
@@ -640,6 +674,8 @@ def main():
     log(f"setup cpu {time.process_time() - T0:.2f}s")
 
     all_nums = sorted(ms)
+    global ALL_COST
+    ALL_COST = pack_cost(ms)
     for cid, ch, run, blind, label, onfail in jobs:
         if run is None:
             sel = {n: ms[n] for n in all_nums}
@@ -661,6 +697,10 @@ def main():
                 sel_pos |= set(onfail)
             sel = {pos2num[p]: ms[pos2num[p]] for p in sel_pos}
             log(cid, f"{label} fp={len(fpc)} run={len(run)} blind={len(blind)} failed={len(failed_pos)} status={status} cpu={cpu:.2f} notes={ch.notes}")
+            if sel and len(sel) < len(all_nums) and pack_cost(sel) >= ALL_COST - 1e-9:
+                # scheduling every test costs no more than this selection: free insurance
+                sel = {n: ms[n] for n in all_nums}
+                log(cid, "selection already costs as much as all tests -> all tests")
         print(json.dumps({"commit": cid, "workers": pack(sel)}), flush=True)
     log(f"total cpu (parent) {time.process_time() - T0:.2f}s")
 
