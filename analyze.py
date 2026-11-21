@@ -30,6 +30,7 @@ class Index:
         self.tpcfp = d.get("tpcfp", {})
         self.state = d.get("state", {})
         self.tpcres = d.get("tpcres", {})
+        self.keyuse = d.get("keyuse")
         self.imports = d["imports"]
 
     def name_set(self, n):
@@ -406,6 +407,8 @@ class Change:
                     for i, tid in enumerate(ix.ids):
                         if tid.startswith(pre):
                             b |= 1 << i
+                elif self.key_reach(k) is not None:
+                    b = self.key_reach(k)
                 else:
                     b = ix.name_set(rest.rsplit(".", 1)[-1])
                     # state of a dialect class (or a class nested in one): only its users see it
@@ -481,6 +484,42 @@ class Change:
         self.precise |= b
         self.notes.append(f"import fails only in {sorted(nb)[:4]}")
         return True
+
+    def key_reach(self, k):
+        """Tests that read the entries of dict constant k that the patch changed (None if the
+        dict is not tracked or its entries cannot be compared)."""
+        cache = self.__dict__.setdefault("_kr", {})
+        if k in cache:
+            return cache[k]
+        cache[k] = None
+        ku = getattr(self.ix, "keyuse", None)
+        new = getattr(self, "dict_entries", {}).get(k)
+        if not ku or new is None:
+            return None
+        try:
+            import keyuse
+        except Exception:  # noqa
+            return None
+        old = keyuse.resolve(k)
+        if type(old) is not dict:
+            return None
+        tags = {ku["tags"].get(a) for a in keyuse.aliases(old)} - {None}
+        if len(tags) != 1:
+            return None
+        tag = tags.pop()
+        oe = keyuse.entries(old)
+        if oe is None:
+            return None
+        changed = {x for x in set(oe) | set(new) if oe.get(x) != new.get(x)}
+        use = ku["use"].get(tag, {})
+        b = ku["unknown"] | use.get("*", 0)
+        if len(oe) != len(new):
+            b |= use.get("#len", 0)
+        for x in changed:
+            b |= use.get(x, 0)
+        self.notes.append(f"key-reach {k.rsplit('.', 1)[-1]} {sorted(changed)[:3]} -> {b.bit_count()}")
+        cache[k] = b
+        return b
 
     def fp_phase_b(self, tid):
         """True if a changed statement runs while queries are planned/executed in Python."""
