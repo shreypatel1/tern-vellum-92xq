@@ -218,6 +218,7 @@ def fp_failures(fp_ids, ch, ix):
             v = m.get(str(i)) or m.get(i)
             return v[1] if v else 1.0
         fail = False
+        checked = 0
         for i in sorted(idxs):
             r = ref.get(str(i)) or ref.get(i)
             n = fpr(i)
@@ -242,8 +243,12 @@ def fp_failures(fp_ids, ch, ix):
                 to_duck.add(("sql", i))
             if n[0] != r[0] or phase_b:
                 to_exec.add(i)
-            if 2.5 + sum(_c(res, j) for j in to_exec) + sum(_c(dres.get(f"{which}:{k}", {}), j) for k, j in to_duck) > FP_EXEC_BUDGET:
+            checked += 1
+            spent = sum(_c(res, j) for j in to_exec) + sum(_c(dres.get(f"{which}:{k}", {}), j) for k, j in to_duck)
+            if 2.5 + spent > FP_EXEC_BUDGET:
                 fail = True; break  # re-checking would cost more than scheduling the test
+            if checked >= 8 and 2.5 + spent * len(idxs) / checked > 1.5 * FP_EXEC_BUDGET:
+                fail = True; break  # on track to blow the budget: stop fingerprinting now
         print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} exec={len(to_exec)} duck={len(to_duck)} fail={fail} phaseB={phase_b}", file=sys.stderr)
         if fail:
             bad.add(tid); continue

@@ -110,7 +110,8 @@ class Change:
         new_text, removed, inserts = patchinfo.apply(old_text, fp)
         self.new_sources[path] = new_text
         opened = ix.opened_set(path)
-        if path.endswith(".py") and patchinfo.classify_fast(old_text, new_text, removed, inserts)["same"]:
+        info = patchinfo.classify_fast(old_text, new_text, removed, inserts) if path.endswith(".py") else None
+        if info is not None and info["same"]:
             # comment/blank-only edit of a module: reading it (imports, linecache) changes nothing
             self.notes.append(f"comment-only {path}")
             return
@@ -120,7 +121,6 @@ class Change:
             if not opened:
                 self.notes.append(f"data file nobody opens: {path}")
             return
-        info = patchinfo.classify_fast(old_text, new_text, removed, inserts)
         if info["same"]:
             self.notes.append(f"comment-only {path}")
             return
