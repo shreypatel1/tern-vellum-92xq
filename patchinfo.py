@@ -607,10 +607,10 @@ def stmt_spans_tree(tree, lines):
     return out
 
 
-def _code_lines(text):
+def _code_lines(code):
     """Line numbers that own at least one bytecode instruction (any nested code object)."""
     out = set()
-    todo = [compile(text, "<x>", "exec", dont_inherit=True)]
+    todo = [code]
     while todo:
         co = todo.pop()
         for _, _, ln in co.co_lines():
@@ -620,7 +620,35 @@ def _code_lines(text):
     return out
 
 
-def exact_lines(old_text, new_text):
+def _segment(text, s, e, col):
+    """Parse lines s..e (1-based) of text, dedented by col, keeping their line numbers."""
+    lines = text.split("\n")[s - 1:e]
+    if any(ln.strip() and len(ln) - len(ln.lstrip()) < col for ln in lines):
+        raise ValueError("segment indentation")
+    src = "\n".join(ln[col:] for ln in lines)
+    tree = ast.parse(src)
+    ast.increment_lineno(tree, s - 1)
+    return tree
+
+
+def _enclosing_def(tree, d):
+    lo, hi = min(d), max(d)
+    best = None
+    todo = [tree]
+    while todo:
+        n = todo.pop()
+        for c in ast.iter_child_nodes(n):
+            if not isinstance(c, ast.stmt):
+                continue
+            end = c.end_lineno or c.lineno
+            if c.lineno <= lo and hi <= end:
+                if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) and not c.decorator_list:
+                    best = c
+                todo.append(c)
+    return best
+
+
+def exact_lines(old_text, new_text, old_tree=None):
     """Changed lines if the edit replaces whole lines in place (same line count) and every
     changed line holds bytecode both before and after: then the new code on such a line runs
     exactly when the old code on it ran (all code before it is unchanged), so per-line
@@ -633,8 +661,15 @@ def exact_lines(old_text, new_text):
     if not d or len(d) > 3:
         return None
     try:
-        ol = _code_lines(old_text)
-        nl = _code_lines(new_text)
+        # only the innermost function holding the edit needs compiling and comparing
+        fn = _enclosing_def(old_tree, d) if old_tree is not None else None
+        if fn is not None:
+            s, e, col = fn.lineno, fn.end_lineno, fn.col_offset
+            ot, nt = _segment(old_text, s, e, col), _segment(new_text, s, e, col)
+        else:
+            ot, nt = ast.parse(old_text), ast.parse(new_text)
+        ol = _code_lines(compile(ot, "<x>", "exec", dont_inherit=True))
+        nl = _code_lines(compile(nt, "<x>", "exec", dont_inherit=True))
     except Exception:
         return None
     if not d <= ol or not d <= nl:
@@ -643,7 +678,7 @@ def exact_lines(old_text, new_text):
     # on other lines, e.g. short-circuit jumps of a reshaped and/or chain, is unchanged)
     try:
         diffs = []
-        _ast_diff(ast.parse(old_text), ast.parse(new_text), [], diffs)
+        _ast_diff(ot, nt, [], diffs)
     except Exception:
         return None
     if not diffs:

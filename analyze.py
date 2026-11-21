@@ -56,6 +56,32 @@ class Index:
         return self.sets[s] if s is not None else 0
 
 
+def _plain_statements(info):
+    """True if every differing unit is a plain statement on both sides: no def, class or lambda
+    inside (their code is not part of the module-state snapshot)."""
+    import ast
+    u = info.get("units")
+    if not u:
+        return False
+    ou, nu, diff = u
+    if not diff:
+        return False
+    for i in diff:
+        for kind, node in (ou[i][1], nu[i][1]):
+            if kind != "stmt":
+                return False
+            for n in ast.walk(node):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    return False
+    return True
+
+
+def _dialect_family_path(path):
+    parts = path[:-3].split("/")
+    return (len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "generators", "parsers", "typing")
+            and parts[2] not in ("dialect", "base", "__init__"))
+
+
 def bits(b):
     out = []
     i = 0
@@ -91,10 +117,16 @@ class Change:
         self.equiv_needs = {}
         self.spans = {}
         self.itime = set()
+        self._exact = {}
         self.it_fallback = 0
         self.diffpaths = set()
         self.it_keys = set()
         self.diff_fallback = 0
+        self.full_diff = False
+        self.syntax_error = False
+        self.import_broken = False
+        self.newly_bad = None
+        self.odd = False
         for fp in self.files:
             self._one(fp)
 
@@ -103,6 +135,7 @@ class Change:
         path = fp.path
         if fp.binary or fp.old is None or fp.new is None or fp.old != fp.new:
             self.unknown = True
+            self.odd = True
             self.notes.append(f"odd file op {fp.old}->{fp.new}")
             if fp.old:
                 self.cand |= ix.opened_set(fp.old) | ix.file_any(fp.old)
@@ -112,6 +145,7 @@ class Change:
             old_text = open(full, encoding="utf-8").read()
         except Exception:
             self.unknown = True
+            self.odd = True
             self.notes.append(f"missing {path}")
             return
         new_text, removed, inserts = patchinfo.apply(old_text, fp)
@@ -154,19 +188,31 @@ class Change:
                 self.diff_fallback |= reach
                 self.notes.append("state-diff pending")
                 return
+            if not info["error"] and not info.get("attrs") and DIFF_STRUCTURAL and _plain_statements(info):
+                # module/class-level statements without any code in them (an `if` guarding
+                # imports, an import, a call made at import time): their effect is the state
+                # every module holds after a full patched import, so diff that
+                self.diffpaths.add(path)
+                self.full_diff = True
+                self.diff_fallback |= reach
+                self.notes.append("state-diff pending (plain statements)")
+                return
             self.cand |= reach
             # statement-level reach for blind decisions: also whole-file (conservative)
             self.precise |= reach
             if info["error"]:
                 # import error -> every test importing it fails; treat as unknown
                 self.unknown = True
+                self.syntax_error = True
             return
         lines = set(removed)
         for p in inserts:
             lines.add(p - 1)
             lines.add(p)
         spans = patchinfo.stmt_spans_tree(info["old_tree"], lines)
-        ex = patchinfo.exact_lines(old_text, new_text)
+        if path not in self._exact:
+            self._exact[path] = patchinfo.exact_lines(old_text, new_text, info.get("old_tree"))
+        ex = self._exact[path]
         if ex is not None:
             # in-place edit of lines that hold code: per-line coverage is exact
             spans = ex
@@ -213,7 +259,9 @@ class Change:
             lines.add(p - 1)
             lines.add(p)
         spans = patchinfo.stmt_spans_tree(info["old_tree"], lines)
-        ex = patchinfo.exact_lines(old_text, new_text)
+        if path not in self._exact:
+            self._exact[path] = patchinfo.exact_lines(old_text, new_text, info.get("old_tree"))
+        ex = self._exact[path]
         if ex is not None:
             # in-place edit of lines that hold code: per-line coverage is exact
             spans = ex
@@ -341,7 +389,9 @@ class Change:
         if keys is None:
             # the patched import failed or could not be checked: anything may break
             self.notes.append("itime-unknown -> all tests")
-            reach = (1 << n) - 1
+            self.import_broken = True
+            self.unknown = True
+            return
         elif len(keys) > 400:
             self.notes.append(f"diff-fallback {len(keys)}")
             reach = self.it_fallback | self.diff_fallback
@@ -376,6 +426,61 @@ class Change:
                 reach = fb
         self.cand |= reach
         self.precise |= reach
+
+    def _all_dialect_tests(self):
+        ix = self.ix
+        if getattr(ix, "_alld", None) is None:
+            dial = [b for k, b in ix.clsuse.items() if k.startswith("sqlglot.dialects.") and k != "sqlglot.dialects.dialect:Dialect"]
+            cnt = {}
+            for b in dial:
+                i = 0
+                while b:
+                    if b & 1:
+                        cnt[i] = cnt.get(i, 0) + 1
+                    b >>= 1
+                    i += 1
+            ix._alld = 0
+            for i, c in cnt.items():
+                if c >= 0.8 * len(dial):
+                    ix._alld |= 1 << i
+        return ix._alld
+
+    def import_fail_reach(self, extra=0):
+        """The patched import failed. If only one dialect's own modules (and test modules) fail to
+        import, the tests that can see it are the structural reach (which covers that dialect's
+        users) plus every test in a test module that no longer imports. Returns True if applied."""
+        nb = self.newly_bad
+        if not nb:
+            return False
+        ix = self.ix
+        if not all(fp.path.endswith(".py") and _dialect_family_path(fp.path) for fp in self.files):
+            # a core module changed: whatever broke one dialect's import may break other code too
+            return False
+        test_mods = set()
+        for m in nb:
+            parts = m.split(".")
+            if parts[0] == "tests":
+                test_mods.add(m.replace(".", "/") + ".py::")
+            elif not (len(parts) == 3 and parts[0] == "sqlglot"
+                      and parts[1] in ("dialects", "generators", "parsers", "typing")
+                      and parts[2] not in ("dialect", "base")):
+                return False
+        b = extra
+        for m in nb:
+            if m.startswith("sqlglot."):
+                # whoever used that dialect (or ran its code) loads the broken module
+                path = m.replace(".", "/") + ".py"
+                b |= self._dialect_users(path) | ix.file_any(path)
+        # and every test that loads (nearly) all dialects, e.g. by iterating over Dialects: the
+        # per-class use map does not always see it touch one particular dialect
+        b |= self._all_dialect_tests()
+        for i, tid in enumerate(ix.ids):
+            if tid.startswith(tuple(test_mods)) if test_mods else False:
+                b |= 1 << i
+        self.cand |= b
+        self.precise |= b
+        self.notes.append(f"import fails only in {sorted(nb)[:4]}")
+        return True
 
     def fp_phase_b(self, tid):
         """True if a changed statement runs while queries are planned/executed in Python."""

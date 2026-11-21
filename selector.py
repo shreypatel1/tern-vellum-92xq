@@ -291,24 +291,20 @@ def fp_failures(fp_ids, ch, ix):
     return bad
 
 
-def state_diff(ch):
-    """Import everything with the patched sources in a child; return the module-state keys
-    that differ from the pinned commit's (None if unknown)."""
-    base = getattr(ch.ix, "state", None)
-    if not base or not base.get("snap"):
-        return None
-    mods = None
-    if not ch.itime:
-        # only module/class-level assignments changed: just the changed modules and the modules
-        # that (transitively) import them can hold different state
-        todo = [p for p in ch.diffpaths]
-        seen = set(todo)
-        while todo:
-            p = todo.pop()
-            for imp in ch.ix.imports.get(p, []):
-                if imp not in seen:
-                    seen.add(imp); todo.append(imp)
-        mods = {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
+def _closure(ch, paths):
+    """sqlglot module names of paths and of every module that (transitively) imports them."""
+    todo = list(paths)
+    seen = set(todo)
+    while todo:
+        p = todo.pop()
+        for imp in ch.ix.imports.get(p, []):
+            if imp not in seen:
+                seen.add(imp); todo.append(imp)
+    return {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
+
+
+def _in_child(fn):
+    """Run fn() in a forked child; return its JSON result (None if it crashed)."""
     r, w = os.pipe()
     sys.stdout.flush(); sys.stderr.flush()
     pid = os.fork()
@@ -318,28 +314,7 @@ def state_diff(ch):
             os.dup2(2, 1)
             import signal
             signal.alarm(30)
-            srcs = {}
-            for p, t in ch.new_sources.items():
-                if p.endswith(".py"):
-                    srcs[modname(p)] = (os.path.join(REPO, p), t)
-            for m in list(sys.modules):
-                if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."):
-                    del sys.modules[m]
-            sys.meta_path.insert(0, PatchedFinder(srcs))
-            os.environ["SKIP_INTEGRATION"] = "0"
-            os.chdir(REPO)
-            import state
-            if mods is None:
-                bad = state.import_everything(REPO)
-                snap = state.snapshot()
-            else:
-                import importlib
-                bad = list(base["bad"])
-                for m in sorted(mods):
-                    importlib.import_module(m)  # an import error -> no output -> unknown
-                state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
-                snap = state.snapshot(mods=mods)
-            b = json.dumps({"bad": bad, "snap": snap}).encode()
+            b = json.dumps(fn()).encode()
             while b:
                 n = os.write(w, b); b = b[n:]
         except BaseException:  # noqa
@@ -360,8 +335,124 @@ def state_diff(ch):
     global ITIME_CPU
     ITIME_CPU += ru.ru_utime + ru.ru_stime
     try:
-        d = json.loads(b"".join(chunks))
+        return json.loads(b"".join(chunks))
     except Exception:
+        return None
+
+
+def _patched_finder(ch, drop):
+    srcs = {}
+    for p, t in ch.new_sources.items():
+        if p.endswith(".py"):
+            srcs[modname(p)] = (os.path.join(REPO, p), t)
+    for m in list(sys.modules):
+        if drop(m):
+            del sys.modules[m]
+    sys.meta_path.insert(0, PatchedFinder(srcs))
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.chdir(REPO)
+
+
+def import_check(ch):
+    """Import every test module (in pytest's collection order) and then every sqlglot module
+    with the patched sources, in a child. True if the same modules import as at the pinned
+    commit; otherwise False, with ch.newly_bad naming the ones that no longer do (None if the
+    child crashed). Order matters: a class body that builds expressions at import time
+    (templates parsed in a generator) can break the import of the first test module to load it."""
+    base = getattr(ch.ix, "state", None)
+    if not base or "bad" not in base:
+        return False
+    mods = _closure(ch, ch.reimport)
+    # one dialect's own modules: everything else stays as the parent imported it
+    keep = all(_dialect_family(m) for m in mods)
+    preimport_all()
+
+    def child():
+        _patched_finder(ch, lambda m: m == "tests" or m.startswith("tests.") or (
+            (m == "sqlglot" or m.startswith("sqlglot.")) and (not keep or m in mods)))
+        return import_pytest_order(REPO)
+    bad = _in_child(child)
+    if bad is None:
+        return False
+    if sorted(bad) != sorted(base["bad"]):
+        ch.newly_bad = set(bad) - set(base["bad"])
+        return False
+    return True
+
+
+def import_pytest_order(repo):
+    import importlib
+    import pkgutil
+    bad = []
+    tests = []
+
+    def walk(d):
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if os.path.isdir(p):
+                if name not in ("__pycache__", "fixtures"):
+                    walk(p)
+            elif name.startswith("test_") and name.endswith(".py"):
+                tests.append(os.path.relpath(p, repo)[:-3].replace(os.sep, "."))
+    walk(os.path.join(repo, "tests"))
+    for m in tests:
+        try:
+            importlib.import_module(m)
+        except BaseException:
+            bad.append(m)
+    import sqlglot
+    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if m.name.endswith("__main__") or m.name in sys.modules:
+            continue
+        try:
+            importlib.import_module(m.name)
+        except Exception:
+            bad.append(m.name)
+    # the rest of tests/ (helpers and modules pytest does not collect), as state.py does
+    for root, _, files in os.walk(os.path.join(repo, "tests")):
+        for f in sorted(files):
+            if f.endswith(".py"):
+                rel = os.path.relpath(os.path.join(root, f), repo)[:-3].replace(os.sep, ".")
+                if rel.endswith("__init__"):
+                    rel = rel[:-9]
+                if rel in sys.modules or rel in bad:
+                    continue
+                try:
+                    importlib.import_module(rel)
+                except BaseException:
+                    bad.append(rel)
+    return bad
+
+
+def state_diff(ch):
+    """Import everything with the patched sources in a child; return the module-state keys
+    that differ from the pinned commit's (None if unknown)."""
+    base = getattr(ch.ix, "state", None)
+    if not base or not base.get("snap"):
+        return None
+    mods = None
+    if not ch.itime and not ch.full_diff:
+        # only module/class-level assignments changed: just the changed modules and the modules
+        # that (transitively) import them can hold different state
+        mods = _closure(ch, ch.diffpaths)
+    preimport_all()
+
+    def child():
+        _patched_finder(ch, lambda m: m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."))
+        import state
+        if mods is None:
+            bad = state.import_everything(REPO)
+            snap = state.snapshot()
+        else:
+            import importlib
+            bad = list(base["bad"])
+            for m in sorted(mods):
+                importlib.import_module(m)  # an import error -> no output -> unknown
+            state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
+            snap = state.snapshot(mods=mods)
+        return {"bad": bad, "snap": snap}
+    d = _in_child(child)
+    if d is None:
         return None
     if sorted(d["bad"]) != sorted(base["bad"]):
         return None
@@ -371,10 +462,86 @@ def state_diff(ch):
         # only what this partial import produced: lazily created package attributes (PEP 562)
         # and submodules nobody imported here are absent, not changed
         old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods and k in new}
-    return sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+    keys = sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+    if ch.full_diff and not ch.itime:
+        # a module global that only the patched import binds (e.g. names imported under a
+        # flipped TYPE_CHECKING guard): the pinned code ran without it, so no code the tests ran
+        # looked it up. Class attributes still count (they shadow inherited ones).
+        added = [k for k in keys if k not in old and "." not in k.split(":", 1)[1]]
+        if added:
+            ch.notes.append(f"new globals ignored {added[:4]}")
+            keys = [k for k in keys if k not in set(added)]
+    return keys
 
 
 ITIME_CPU = 0.0
+_PREIMPORTED = []
+
+
+def _dialect_family(m):
+    parts = m.split(".")
+    return (len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "generators", "parsers", "typing")
+            and parts[2] not in ("dialect", "base"))
+
+
+def preimport_all():
+    """Import every sqlglot and test module once in the parent (pytest order), so a patched
+    import in a child only redoes the modules a change can reach."""
+    if _PREIMPORTED:
+        return
+    _PREIMPORTED.append(1)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    cwd = os.getcwd()
+    os.chdir(REPO)
+    try:
+        import state
+        state.import_everything(REPO)
+    except Exception:  # noqa
+        pass
+    finally:
+        os.chdir(cwd)
+
+
+# Tests whose cost is input size, checked on a scaled-down copy (same code paths, same ratio of
+# input size to node limit): a failure of the copy schedules the real test.
+# (test id, file the copy is taken from, [(old, new) source edits], cpu of the copy, timeout)
+SHRINK = {
+    "tests/test_parser.py::TestParser::test_max_nodes": (
+        "tests/test_parser.py",
+        [("width = 10000", "width = 100"),
+         ("parse_one(sql, max_nodes=1_000_000)\n", "parse_one(sql, max_nodes=10_000)\n"),
+         ("max_nodes=50_000", "max_nodes=500"),
+         ('"(50000)"', '"(500)"')],
+        0.3, 5.0),
+}
+
+
+# checked (not scheduled blind) even when a change reaches everything
+UNKNOWN_TRY = list(SHRINK) + ["tests/test_generator.py::TestGenerator::test_generator_memory"]
+
+
+def shrink_ok(ch, tid):
+    """The scaled-down copy can stand in for tid under this change."""
+    return tid in SHRINK and not any(fp.path == SHRINK[tid][0] for fp in ch.files)
+
+
+def install_shrunk(tid):
+    """Replace the test method with its scaled-down copy (in the child, after imports)."""
+    import harness
+    import inspect
+    import textwrap
+    cls, meth = harness.get_class(tid)
+    fn = getattr(cls, meth)
+    src = textwrap.dedent(inspect.getsource(fn))
+    for a, b in SHRINK[tid][1]:
+        if src.count(a) != 1:
+            return False
+        src = src.replace(a, b)
+    mod = sys.modules[cls.__module__]
+    ns = {}
+    exec(compile(src, mod.__file__, "exec"), vars(mod), ns)
+    setattr(cls, meth, ns[fn.__name__])
+    return True
 
 
 def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None):
@@ -410,6 +577,15 @@ def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None
         failed = set()
         if fp_ids:
             failed |= fp_failures(fp_ids, ch, ix)
+        for tid in run_ids:
+            if tid in SHRINK:
+                try:
+                    if not install_shrunk(tid):
+                        failed.add(tid)
+                        run_ids = [t for t in run_ids if t != tid]
+                except Exception:  # noqa
+                    failed.add(tid)
+                    run_ids = [t for t in run_ids if t != tid]
         failed |= harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
         os.write(wfd, json.dumps(sorted(failed)).encode())
     except BaseException as e:  # noqa
@@ -508,6 +684,11 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
     S = [p for p in S if p not in set(fpc)]
     if not S:
         return [], [], "empty" if not fpc else "fp-only", []
+    if any(ix.ids[p] in SHRINK for p in S):
+        per = list(per)
+        for p in S:
+            if ix.ids[p] in SHRINK and shrink_ok(ch, ix.ids[p]):
+                per[p] = SHRINK[ix.ids[p]][2]
     forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail]
     runnable = [p for p in S if p not in set(forced)]
     py_changed = bool(ch.swap or ch.reimport)
@@ -596,6 +777,11 @@ def main():
                 # the changed code already runs in most tests: schedule everything, skip the checks
                 ch.unknown = True
                 ch.notes.append("broad import-time change -> all tests")
+            if ch.reimport and not ch.unknown and not import_check(ch):
+                if not ch.import_fail_reach(ch.it_fallback | ch.diff_fallback):
+                    ch.unknown = True
+                    ch.import_broken = True
+                    ch.notes.append("patched import fails -> all tests")
             if (ch.itime or ch.diffpaths) and not ch.unknown:
                 ch.apply_itime(state_diff(ch))
         except Exception as e:  # noqa
@@ -640,9 +826,22 @@ def main():
     log(f"setup cpu {time.process_time() - T0:.2f}s")
 
     all_nums = sorted(ms)
+    full = {n: ms[n] for n in all_nums}
+    full_cost = pack_cost(full)
     for cid, ch, run, blind, label, onfail in jobs:
         if run is None:
             sel = {n: ms[n] for n in all_nums}
+            if ch is not None and ch.reimport and not ch.syntax_error and not ch.odd and not ch.import_broken:
+                # every test is scheduled; the costliest ones that have a cheap stand-in are
+                # checked with the patched import instead, and dropped if they pass
+                try_ids = [t for t in UNKNOWN_TRY if t in num_of and (t not in SHRINK or shrink_ok(ch, t))]
+                tmo = {t: SHRINK[t][3] if t in SHRINK else 20.0 for t in try_ids}
+                res, status = run_in_fork(ch, try_ids, funcs_by_file, tmo, (), ix)
+                if res is not None:
+                    for t in try_ids:
+                        if t not in res:
+                            sel.pop(num_of[t], None)
+                log(cid, f"unknown: checked {len(try_ids)} status={status} failed={None if res is None else len(res)} cpu={LAST_CPU:.2f}")
             log(cid, "UNKNOWN -> all tests", ch.notes if ch else "")
         else:
             failed_pos = set()
@@ -651,7 +850,7 @@ def main():
             fpc = getattr(ch, "fpcheck", []) if ch is not None else []
             if run or fpc:
                 rid = [ix.ids[p] for p in run]
-                tmo = {ix.ids[p]: max(2.0, 10 * ix.cpu[p]) for p in run}
+                tmo = {ix.ids[p]: SHRINK[ix.ids[p]][3] if ix.ids[p] in SHRINK else max(2.0, 10 * ix.cpu[p]) for p in run}
                 res, status = run_in_fork(ch, rid, funcs_by_file, tmo, [ix.ids[p] for p in fpc], ix)
                 cpu = LAST_CPU
                 allp = list(run) + list(fpc)
@@ -661,6 +860,8 @@ def main():
                 sel_pos |= set(onfail)
             sel = {pos2num[p]: ms[pos2num[p]] for p in sel_pos}
             log(cid, f"{label} fp={len(fpc)} run={len(run)} blind={len(blind)} failed={len(failed_pos)} status={status} cpu={cpu:.2f} notes={ch.notes}")
+        if sel and len(sel) < len(all_nums) and full_cost <= pack_cost(sel):
+            sel = full  # running everything costs no more: free insurance against a miss
         print(json.dumps({"commit": cid, "workers": pack(sel)}), flush=True)
     log(f"total cpu (parent) {time.process_time() - T0:.2f}s")
 
