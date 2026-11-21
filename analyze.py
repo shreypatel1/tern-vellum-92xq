@@ -338,12 +338,12 @@ class Change:
         if keys is not None:
             keys = [k for k in keys if k not in self.it_keys]
         n = len(ix.ids)
-        if keys is None and self.itime:
+        if keys is None:
             # the patched import failed or could not be checked: anything may break
             self.notes.append("itime-unknown -> all tests")
             reach = (1 << n) - 1
-        elif keys is None or len(keys) > 400:
-            self.notes.append(f"diff-fallback {None if keys is None else len(keys)}")
+        elif len(keys) > 400:
+            self.notes.append(f"diff-fallback {len(keys)}")
             reach = self.it_fallback | self.diff_fallback
         else:
             self.notes.append(f"itime-diff {sorted(keys)[:6]}")
@@ -380,6 +380,11 @@ class Change:
     def fp_phase_b(self, tid):
         """True if a changed statement runs while queries are planned/executed in Python."""
         sub = self.ix.subcov[tid]
+        for path in list(self.spans) + list(self.reimport):
+            if path.startswith("sqlglot/executor/"):
+                # executor code outside the recorded plan/execute window (execute()'s own body:
+                # schema setup, optimize call, return) is not fingerprinted: execute for real
+                return True
         for path, sp in self.spans.items():
             B = sub["blines"].get(path)
             if B and (sp & set(B)):
