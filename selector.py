@@ -210,9 +210,11 @@ def fp_failures(fp_ids, ch, ix):
                     bool(now[i][3]) != ((ix.tpcres.get(which, {}).get(str(i)) or ["NONE"])[0] != "NONE") for i in now):
                 bad.add(tid); continue
         res = ix.tpcres.get(which, {})
+        dres = ix.tpcres.get("duck", {})
         phase_b = ch.fp_phase_b(tid)
         execq = {int(i) for i, v in res.items() if v[0] != "NONE"}
         to_exec = set()
+        to_duck = set()  # (kind, i)
         fail = False
         for i in idxs:
             r = ref.get(str(i)) or ref.get(i)
@@ -220,24 +222,32 @@ def fp_failures(fp_ids, ch, ix):
             if r is None or n is None:
                 fail = True; break
             if mode == "opt":
-                if n[1] != r[1] or n[2] != r[2]:
-                    fail = True; break
+                if n[1] != r[1]:
+                    to_duck.add(("sql", i))
+                if n[2] != r[2]:
+                    to_duck.add(("opt", i))
                 continue
             if i not in execq:
                 # never compared: only an exception while parsing/pickling can fail it
                 if n[0].startswith("ERR") and n[0] != r[0]:
                     fail = True; break
                 continue
-            if n[1] != r[1] or n[0].startswith("ERR"):
+            if n[0].startswith("ERR"):
                 fail = True; break
+            if n[1] != r[1]:
+                to_duck.add(("sql", i))
             if n[0] != r[0] or phase_b:
                 to_exec.add(i)
-        print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} exec={len(to_exec)} fail={fail} phaseB={phase_b}", file=sys.stderr)
+        print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} exec={len(to_exec)} duck={len(to_duck)} fail={fail} phaseB={phase_b}", file=sys.stderr)
         if fail:
             bad.add(tid); continue
-        if not to_exec:
+        if not to_exec and not to_duck:
             continue
-        est = 2.5 + sum(res[str(i)][1] if str(i) in res else res[i][1] for i in to_exec)
+
+        def _c(m, i):
+            v = m.get(str(i)) or m.get(i)
+            return v[1] if v else 1.0
+        est = 2.5 + sum(_c(res, i) for i in to_exec) + sum(_c(dres.get(f"{which}:{k}", {}), i) for k, i in to_duck)
         if est > FP_EXEC_BUDGET:
             bad.add(tid); continue
         import signal
@@ -248,10 +258,16 @@ def fp_failures(fp_ids, ch, ix):
             import tpcres
             if not loaded:
                 loaded.append(tpcres.load())
-            got = tpcres.run(loaded[0], which, to_exec)
-            for i, (h, _) in got.items():
-                if h != (res.get(str(i)) or res.get(i))[0]:
-                    bad.add(tid); break
+            got = tpcres.run(loaded[0], which, to_exec) if to_exec else {}
+            ok = all(h == (res.get(str(i)) or res.get(i))[0] for i, (h, _) in got.items())
+            for kind in ("sql", "opt"):
+                idk = {i for k, i in to_duck if k == kind}
+                if ok and idk:
+                    base = dres.get(f"{which}:{kind}", {})
+                    dg = tpcres.duck(loaded[0], which, kind, idk)
+                    ok = all(base.get(str(i)) and h == base[str(i)][0] and not h.startswith("ERR") for i, (h, _) in dg.items())
+            if not ok:
+                bad.add(tid)
         except BaseException:  # noqa
             bad.add(tid)
         finally:

@@ -50,6 +50,30 @@ def run(cls, which, idxs):
     return out
 
 
+def df_hash(df):
+    s = repr(list(df.columns)) + repr([str(d) for d in df.dtypes]) + df.to_csv(index=False)
+    return hashlib.sha1(s.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def duck(cls, which, kind, idxs):
+    """Hash DuckDB's result for transpile(sql) (kind 'sql') or transpile(optimized) ('opt')."""
+    from sqlglot import transpile
+    conn = cls.tpch_conn if which == "tpch" else cls.tpcds_conn
+    sqls = cls.tpch_sqls if which == "tpch" else cls.tpcds_sqls
+    out = {}
+    for i in sorted(idxs):
+        _, sql, optimized = sqls[i]
+        t = _cpu()
+        try:
+            h = df_hash(conn.execute(transpile(sql if kind == "sql" else optimized, write="duckdb")[0]).fetchdf())
+        except BaseException as ex:  # noqa
+            if ex.__class__.__name__ == "_Timeout":
+                raise
+            h = "ERR:" + ex.__class__.__name__
+        out[i] = [h, round(_cpu() - t, 4)]
+    return out
+
+
 if __name__ == "__main__":
     import json
     repo = sys.argv[1]
@@ -58,7 +82,10 @@ if __name__ == "__main__":
     os.chdir(repo)
     os.environ["SKIP_INTEGRATION"] = "0"
     cls = load()
-    res = {w: run(cls, w, range(len(cls.tpch_sqls if w == "tpch" else cls.tpcds_sqls))) for w in ("tpch", "tpcds")}
+    n = {"tpch": len(cls.tpch_sqls), "tpcds": len(cls.tpcds_sqls)}
+    res = {w: run(cls, w, range(n[w])) for w in ("tpch", "tpcds")}
+    res["duck"] = {"tpch:sql": duck(cls, "tpch", "sql", range(n["tpch"])), "tpch:opt": duck(cls, "tpch", "opt", range(n["tpch"])),
+                   "tpcds:sql": duck(cls, "tpcds", "sql", range(n["tpcds"]))}
     json.dump(res, open(sys.argv[2], "w"))
-    for w, m in res.items():
+    for w, m in list(res.items())[:2] + list(res["duck"].items()):
         print(w, len(m), round(sum(v[1] for v in m.values()), 2), sum(v[0].startswith("ERR") for v in m.values()), file=sys.stderr)
