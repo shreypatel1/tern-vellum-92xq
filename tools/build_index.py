@@ -73,7 +73,9 @@ FP = _os.environ.get("TPCFP")
 tpcfp = json.load(open(FP)) if FP else {}
 ST = _os.environ.get("STATE")
 state = json.load(open(ST)) if ST else {}
-data = {"state": state, "tpcfp": tpcfp, "subcov": subcov, "importtime": importtime, "exprclasses": exprclasses, "inst": {k: sid(b) for k, b in inst.items()}, "runtime_only": runtime_only, "names": names, "imports": imports, "ids": [t["id"] for t in tests], "cpu": cpu, "basefail": basefail, "sets": sets, "lines": lines, "opened": op}
+TR = _os.environ.get("TPCRES")
+tpcres = json.load(open(TR)) if TR else {}
+data = {"tpcres": tpcres, "state": state, "tpcfp": tpcfp, "subcov": subcov, "importtime": importtime, "exprclasses": exprclasses, "inst": {k: sid(b) for k, b in inst.items()}, "runtime_only": runtime_only, "names": names, "imports": imports, "ids": [t["id"] for t in tests], "cpu": cpu, "basefail": basefail, "sets": sets, "lines": lines, "opened": op}
 raw = pickle.dumps(data, protocol=5)
 open(OUT, "wb").write(zlib.compress(raw, 9))
 print("files", len(lines), "entries", sum(len(m) for m in lines.values()), "sets", len(sets), "bytes", len(raw), "->", len(zlib.compress(raw, 9)))

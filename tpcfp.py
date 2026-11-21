@@ -53,7 +53,7 @@ def fingerprints(which, idxs=None):
         fe = _safe(ex)
         t1 = _safe(lambda: transpile(sql, write="duckdb")[0])
         t2 = _safe(lambda: transpile(optimized, write="duckdb")[0])
-        out[i] = [fe, t1, t2]
+        out[i] = [fe, t1, t2, execute]
     return out
 
 

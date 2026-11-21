@@ -6,7 +6,7 @@ RUN pip install --no-deps -r /app/requirements.lock
 # sqlglot at the pinned commit, from its own repository.
 ADD https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz /tmp/sqlglot.tar.gz
 RUN mkdir -p /app/sq && tar xzf /tmp/sqlglot.tar.gz -C /app/sq --strip-components=1 && rm /tmp/sqlglot.tar.gz
-COPY selector.py analyze.py patchinfo.py harness.py tpcfp.py state.py index.bin /app/br/
+COPY selector.py analyze.py patchinfo.py harness.py tpcfp.py tpcres.py state.py index.bin /app/br/
 RUN python -m compileall -q /app/sq/sqlglot /app/sq/tests /app/br && chmod -R a+rX /app
 ENV PYTHONPATH=/app/sq SKIP_INTEGRATION=0 BR_REPO=/app/sq BR_DATA=/data
 WORKDIR /app/sq

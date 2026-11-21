@@ -23,6 +23,7 @@ class Index:
         self.subcov = d.get("subcov", {})
         self.tpcfp = d.get("tpcfp", {})
         self.state = d.get("state", {})
+        self.tpcres = d.get("tpcres", {})
         self.imports = d["imports"]
 
     def name_set(self, n):
@@ -58,6 +59,10 @@ def bits(b):
         b >>= 1
         i += 1
     return out
+
+
+TPC_FIXTURES = {"tpch": "tests/fixtures/optimizer/tpc-h/tpc-h.sql",
+                "tpcds": "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
 
 
 class Change:
@@ -214,16 +219,18 @@ class Change:
         for fp in self.files:
             path = fp.path
             if not path.endswith(".py"):
-                if (self.ix.opened_set(path) >> pos) & 1:
+                if (self.ix.opened_set(path) >> pos) & 1 and path not in TPC_FIXTURES.values():
                     return False
                 continue
+            if path.startswith("tests/"):
+                return False  # the test's own code (comparison, helpers) is not fingerprinted
             B = sub["blines"].get(path)
             if path in self.reimport:
                 if B:
                     return False
             elif path in self.swap:
                 sp = self.spans.get(path, set())
-                if B and (sp & set(B)):
+                if B and (sp & set(B)) and not self.ix.tpcres:
                     return False
                 # changed lines the test ran outside any per-query run (class setup etc.)
                 q = sub["lines"].get(path, {})
@@ -263,10 +270,19 @@ class Change:
         self.cand |= reach
         self.precise |= reach
 
+    def fp_phase_b(self, tid):
+        """True if a changed statement runs while queries are planned/executed in Python."""
+        sub = self.ix.subcov[tid]
+        for path, sp in self.spans.items():
+            B = sub["blines"].get(path)
+            if B and (sp & set(B)):
+                return True
+        return False
+
     def fp_queries(self, tid):
         """Indices of the TPC queries whose run touched a changed statement (None = all)."""
         sub = self.ix.subcov[tid]
-        if self.reimport:
+        if self.reimport or any(fp.path in TPC_FIXTURES.values() for fp in self.files):
             return None
         m = 0
         for path, sp in self.spans.items():

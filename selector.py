@@ -174,34 +174,21 @@ FP_TESTS = {
 }
 
 
-FP_ATTR = {"tpcds": "tpcds_sqls", "tpch": "tpch_sqls"}
-FP_RUN_BUDGET = float(os.environ.get("BR_FP_BUDGET", "3.0"))
-
-
-def _run_subset(tid, attr, idxs, timeout):
-    """Run one TPC test restricted to the given query indices (patched code is live)."""
-    import harness
-    harness.import_all([tid])
-    harness.install_inline_pools()
-    cls, _ = harness.get_class(tid)
-    orig_setup = cls.__dict__["setUpClass"]
-
-    def setup(c):
-        orig_setup.__func__(c)
-        full = getattr(c, attr)
-        setattr(c, attr, [full[i] for i in sorted(idxs)])
-    cls.setUpClass = classmethod(setup)
-    try:
-        return bool(harness.run_tests([tid], timeout_for=lambda t: timeout))
-    finally:
-        cls.setUpClass = orig_setup
+FP_EXEC_BUDGET = float(os.environ.get("BR_FP_EXEC", "13.0"))
 
 
 def fp_failures(fp_ids, ch, ix):
-    """Fingerprint the queries a change reaches; run the real test on the ones that moved."""
+    """Decide the TPC executor tests without running them whole.
+
+    Fingerprint the queries the change reaches (parsed+pickled expression, optimized expression,
+    DuckDB transpilations). Queries the test does not execute can only fail by raising while
+    being parsed/pickled. Executed queries whose optimized form moved (or whose Python execution
+    path changed) are executed with the patched code and their result compared to the pinned
+    commit's result, which the unpatched test proves equal to DuckDB's."""
     import tpcfp
     bad = set()
     cache = {}
+    loaded = []
     for tid in fp_ids:
         which, mode = FP_TESTS[tid]
         q = ch.fp_queries(tid)
@@ -216,30 +203,60 @@ def fp_failures(fp_ids, ch, ix):
             now.update(tpcfp.fingerprints(which, need - done))
             cache[which] = (done | need, now)
         now = cache[which][1]
-        moved = set()
+        if q is None:
+            if set(now) != {int(i) for i in ref}:
+                bad.add(tid); continue
+            if any(len(r) > 3 for r in now.values()) and any(
+                    bool(now[i][3]) != ((ix.tpcres.get(which, {}).get(str(i)) or ["NONE"])[0] != "NONE") for i in now):
+                bad.add(tid); continue
+        res = ix.tpcres.get(which, {})
+        phase_b = ch.fp_phase_b(tid)
+        execq = {int(i) for i, v in res.items() if v[0] != "NONE"}
+        to_exec = set()
+        fail = False
         for i in idxs:
             r = ref.get(str(i)) or ref.get(i)
             n = now.get(i)
             if r is None or n is None:
-                moved.add(i); continue
-            if mode == "exec":
-                if n[0] != r[0] or n[1] != r[1]:
-                    moved.add(i)
-            elif n[1] != r[1] or n[2] != r[2]:
-                moved.add(i)
-        print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} moved={sorted(moved)[:12]}", file=sys.stderr)
-        if not moved:
-            continue
-        pos = ix.ids.index(tid)
-        sub = ix.subcov.get(tid, {})
-        per_q = CPU_SCALE * ix.cpu[pos] / max(1, sub.get("n", 1))
-        if 1.5 + per_q * len(moved) > FP_RUN_BUDGET:
+                fail = True; break
+            if mode == "opt":
+                if n[1] != r[1] or n[2] != r[2]:
+                    fail = True; break
+                continue
+            if i not in execq:
+                # never compared: only an exception while parsing/pickling can fail it
+                if n[0].startswith("ERR") and n[0] != r[0]:
+                    fail = True; break
+                continue
+            if n[1] != r[1] or n[0].startswith("ERR"):
+                fail = True; break
+            if n[0] != r[0] or phase_b:
+                to_exec.add(i)
+        print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} exec={len(to_exec)} fail={fail} phaseB={phase_b}", file=sys.stderr)
+        if fail:
             bad.add(tid); continue
+        if not to_exec:
+            continue
+        est = 2.5 + sum(res[str(i)][1] if str(i) in res else res[i][1] for i in to_exec)
+        if est > FP_EXEC_BUDGET:
+            bad.add(tid); continue
+        import signal
+        import harness
+        prev = signal.signal(signal.SIGALRM, harness._alarm)
         try:
-            if _run_subset(tid, FP_ATTR[which], moved, max(5.0, 10 * per_q * len(moved))):
-                bad.add(tid)
-        except BaseException:
+            signal.setitimer(signal.ITIMER_REAL, 3 * FP_EXEC_BUDGET)
+            import tpcres
+            if not loaded:
+                loaded.append(tpcres.load())
+            got = tpcres.run(loaded[0], which, to_exec)
+            for i, (h, _) in got.items():
+                if h != (res.get(str(i)) or res.get(i))[0]:
+                    bad.add(tid); break
+        except BaseException:  # noqa
             bad.add(tid)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, prev)
     return bad
 
 
