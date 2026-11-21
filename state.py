@@ -140,12 +140,37 @@ def snapshot(prefixes=("sqlglot", "tests"), mods=None):
     return out
 
 
+def pytest_order(repo):
+    """Test modules in the order pytest collects them (each directory's entries sorted by name,
+    files and directories together)."""
+    import os
+    out = []
+
+    def walk(d):
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if os.path.isdir(p):
+                if name not in ("__pycache__", "fixtures"):
+                    walk(p)
+            elif name.startswith("test_") and name.endswith(".py"):
+                out.append(os.path.relpath(p, repo)[:-3].replace(os.sep, "."))
+    walk(os.path.join(repo, "tests"))
+    return out
+
+
 def import_everything(repo):
     import importlib
     import os
     import pkgutil
-    import sqlglot
     bad = []
+    # test modules first, in pytest's collection order: what a module builds at import time
+    # (templates parsed in a class body) can depend on which modules were imported before it
+    for rel in pytest_order(repo):
+        try:
+            importlib.import_module(rel)
+        except BaseException:
+            bad.append(rel)
+    import sqlglot
     for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         if m.name.endswith("__main__"):
             continue
@@ -159,6 +184,8 @@ def import_everything(repo):
                 rel = os.path.relpath(os.path.join(root, f), repo)[:-3].replace(os.sep, ".")
                 if rel.endswith("__init__"):
                     rel = rel[:-9]
+                if rel in sys.modules or rel in bad:
+                    continue
                 try:
                     importlib.import_module(rel)
                 except BaseException:

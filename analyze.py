@@ -116,6 +116,9 @@ class Change:
         self.it_keys = set()
         self.diff_fallback = 0
         self.full_diff = False
+        self.syntax_error = False
+        self.import_broken = False
+        self.odd = False
         for fp in self.files:
             self._one(fp)
 
@@ -124,6 +127,7 @@ class Change:
         path = fp.path
         if fp.binary or fp.old is None or fp.new is None or fp.old != fp.new:
             self.unknown = True
+            self.odd = True
             self.notes.append(f"odd file op {fp.old}->{fp.new}")
             if fp.old:
                 self.cand |= ix.opened_set(fp.old) | ix.file_any(fp.old)
@@ -133,6 +137,7 @@ class Change:
             old_text = open(full, encoding="utf-8").read()
         except Exception:
             self.unknown = True
+            self.odd = True
             self.notes.append(f"missing {path}")
             return
         new_text, removed, inserts = patchinfo.apply(old_text, fp)
@@ -190,6 +195,7 @@ class Change:
             if info["error"]:
                 # import error -> every test importing it fails; treat as unknown
                 self.unknown = True
+                self.syntax_error = True
             return
         lines = set(removed)
         for p in inserts:
@@ -368,10 +374,12 @@ class Change:
         if keys is not None:
             keys = [k for k in keys if k not in self.it_keys]
         n = len(ix.ids)
-        if keys is None and self.itime:
+        if keys is None:
             # the patched import failed or could not be checked: anything may break
             self.notes.append("itime-unknown -> all tests")
-            reach = (1 << n) - 1
+            self.import_broken = True
+            self.unknown = True
+            return
         elif keys is None or len(keys) > 400:
             self.notes.append(f"diff-fallback {None if keys is None else len(keys)}")
             reach = self.it_fallback | self.diff_fallback

@@ -291,9 +291,11 @@ def fp_failures(fp_ids, ch, ix):
     return bad
 
 
-def state_diff(ch):
+def state_diff(ch, want_snapshot=True):
     """Import everything with the patched sources in a child; return the module-state keys
-    that differ from the pinned commit's (None if unknown)."""
+    that differ from the pinned commit's (None if unknown, or if any sqlglot/test module that
+    imported at the pinned commit fails to import now). want_snapshot=False: only the import
+    check ([] when it passes)."""
     base = getattr(ch.ix, "state", None)
     if not base or not base.get("snap"):
         return None
@@ -329,14 +331,14 @@ def state_diff(ch):
             os.environ["SKIP_INTEGRATION"] = "0"
             os.chdir(REPO)
             import state
-            if mods is None:
-                bad = state.import_everything(REPO)
+            # always the full import (tests too): a class body that builds expressions at import
+            # time (templates parsed in a generator) can break a test module's import
+            bad = state.import_everything(REPO)
+            if not want_snapshot:
+                snap = {}
+            elif mods is None:
                 snap = state.snapshot()
             else:
-                import importlib
-                bad = list(base["bad"])
-                for m in sorted(mods):
-                    importlib.import_module(m)  # an import error -> no output -> unknown
                 state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
                 snap = state.snapshot(mods=mods)
             b = json.dumps({"bad": bad, "snap": snap}).encode()
@@ -365,6 +367,8 @@ def state_diff(ch):
         return None
     if sorted(d["bad"]) != sorted(base["bad"]):
         return None
+    if not want_snapshot:
+        return []
     noisy = set(base["noisy"])
     old, new = (base["snap"] if mods is None else base["snapl"]), d["snap"]
     if mods is not None:
@@ -384,6 +388,48 @@ def state_diff(ch):
 
 
 ITIME_CPU = 0.0
+
+
+# Tests whose cost is input size, checked on a scaled-down copy (same code paths, same ratio of
+# input size to node limit): a failure of the copy schedules the real test.
+# (test id, file the copy is taken from, [(old, new) source edits], cpu of the copy, timeout)
+SHRINK = {
+    "tests/test_parser.py::TestParser::test_max_nodes": (
+        "tests/test_parser.py",
+        [("width = 10000", "width = 100"),
+         ("parse_one(sql, max_nodes=1_000_000)\n", "parse_one(sql, max_nodes=10_000)\n"),
+         ("max_nodes=50_000", "max_nodes=500"),
+         ('"(50000)"', '"(500)"')],
+        0.3, 5.0),
+}
+
+
+# checked (not scheduled blind) even when a change reaches everything
+UNKNOWN_TRY = list(SHRINK) + ["tests/test_generator.py::TestGenerator::test_generator_memory"]
+
+
+def shrink_ok(ch, tid):
+    """The scaled-down copy can stand in for tid under this change."""
+    return tid in SHRINK and not any(fp.path == SHRINK[tid][0] for fp in ch.files)
+
+
+def install_shrunk(tid):
+    """Replace the test method with its scaled-down copy (in the child, after imports)."""
+    import harness
+    import inspect
+    import textwrap
+    cls, meth = harness.get_class(tid)
+    fn = getattr(cls, meth)
+    src = textwrap.dedent(inspect.getsource(fn))
+    for a, b in SHRINK[tid][1]:
+        if src.count(a) != 1:
+            return False
+        src = src.replace(a, b)
+    mod = sys.modules[cls.__module__]
+    ns = {}
+    exec(compile(src, mod.__file__, "exec"), vars(mod), ns)
+    setattr(cls, meth, ns[fn.__name__])
+    return True
 
 
 def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None):
@@ -419,6 +465,15 @@ def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None
         failed = set()
         if fp_ids:
             failed |= fp_failures(fp_ids, ch, ix)
+        for tid in run_ids:
+            if tid in SHRINK:
+                try:
+                    if not install_shrunk(tid):
+                        failed.add(tid)
+                        run_ids = [t for t in run_ids if t != tid]
+                except Exception:  # noqa
+                    failed.add(tid)
+                    run_ids = [t for t in run_ids if t != tid]
         failed |= harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
         os.write(wfd, json.dumps(sorted(failed)).encode())
     except BaseException as e:  # noqa
@@ -517,6 +572,11 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
     S = [p for p in S if p not in set(fpc)]
     if not S:
         return [], [], "empty" if not fpc else "fp-only", []
+    if any(ix.ids[p] in SHRINK for p in S):
+        per = list(per)
+        for p in S:
+            if ix.ids[p] in SHRINK and shrink_ok(ch, ix.ids[p]):
+                per[p] = SHRINK[ix.ids[p]][2]
     forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail]
     runnable = [p for p in S if p not in set(forced)]
     py_changed = bool(ch.swap or ch.reimport)
@@ -607,6 +667,10 @@ def main():
                 ch.notes.append("broad import-time change -> all tests")
             if (ch.itime or ch.diffpaths) and not ch.unknown:
                 ch.apply_itime(state_diff(ch))
+            elif ch.reimport and not ch.unknown and state_diff(ch, want_snapshot=False) is None:
+                ch.unknown = True
+                ch.import_broken = True
+                ch.notes.append("patched import fails -> all tests")
         except Exception as e:  # noqa
             log("analysis failed", cid, e)
             ch = None
@@ -652,6 +716,17 @@ def main():
     for cid, ch, run, blind, label, onfail in jobs:
         if run is None:
             sel = {n: ms[n] for n in all_nums}
+            if ch is not None and ch.reimport and not ch.syntax_error and not ch.odd and not ch.import_broken:
+                # every test is scheduled; the costliest ones that have a cheap stand-in are
+                # checked with the patched import instead, and dropped if they pass
+                try_ids = [t for t in UNKNOWN_TRY if t in num_of and (t not in SHRINK or shrink_ok(ch, t))]
+                tmo = {t: SHRINK[t][3] if t in SHRINK else 20.0 for t in try_ids}
+                res, status = run_in_fork(ch, try_ids, funcs_by_file, tmo, (), ix)
+                if res is not None:
+                    for t in try_ids:
+                        if t not in res:
+                            sel.pop(num_of[t], None)
+                log(cid, f"unknown: checked {len(try_ids)} status={status} failed={None if res is None else len(res)} cpu={LAST_CPU:.2f}")
             log(cid, "UNKNOWN -> all tests", ch.notes if ch else "")
         else:
             failed_pos = set()
@@ -660,7 +735,7 @@ def main():
             fpc = getattr(ch, "fpcheck", []) if ch is not None else []
             if run or fpc:
                 rid = [ix.ids[p] for p in run]
-                tmo = {ix.ids[p]: max(2.0, 10 * ix.cpu[p]) for p in run}
+                tmo = {ix.ids[p]: SHRINK[ix.ids[p]][3] if ix.ids[p] in SHRINK else max(2.0, 10 * ix.cpu[p]) for p in run}
                 res, status = run_in_fork(ch, rid, funcs_by_file, tmo, [ix.ids[p] for p in fpc], ix)
                 cpu = LAST_CPU
                 allp = list(run) + list(fpc)
