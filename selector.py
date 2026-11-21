@@ -330,6 +330,7 @@ def state_diff(ch):
                 bad = list(base["bad"])
                 for m in sorted(mods):
                     importlib.import_module(m)  # an import error -> no output -> unknown
+                state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
                 snap = state.snapshot(mods=mods)
             b = json.dumps({"bad": bad, "snap": snap}).encode()
             while b:
@@ -358,9 +359,11 @@ def state_diff(ch):
     if sorted(d["bad"]) != sorted(base["bad"]):
         return None
     noisy = set(base["noisy"])
-    old, new = base["snap"], d["snap"]
+    old, new = (base["snap"] if mods is None else base["snapl"]), d["snap"]
     if mods is not None:
-        old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods}
+        # only what this partial import produced: lazily created package attributes (PEP 562)
+        # and submodules nobody imported here are absent, not changed
+        old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods and k in new}
     return sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
 
 

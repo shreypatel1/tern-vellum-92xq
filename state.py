@@ -1,6 +1,8 @@
 """Canonical fingerprints of module-level state (globals and class attributes) after import.
 Used to tell whether a change to code that runs at import time changes anything the tests see."""
 import enum
+import functools
+import logging
 import hashlib
 import re
 import sys
@@ -8,6 +10,22 @@ import types
 
 _FUNCS = (types.FunctionType, types.BuiltinFunctionType, types.MethodType, types.BuiltinMethodType,
           types.WrapperDescriptorType, types.MethodDescriptorType, types.MethodWrapperType)
+
+
+LAMBDA_CODE = False  # True: lambdas written in assignments count as state (their code)
+
+
+def _code(co):
+    """What a code object does (bytecode, names, constants), not where it sits in the file."""
+    parts = [co.co_code.hex(), ",".join(co.co_names), ",".join(co.co_varnames)]
+    for c in co.co_consts:
+        if isinstance(c, types.CodeType):
+            parts.append(_code(c))
+        elif isinstance(c, frozenset):
+            parts.append("fs{" + ",".join(sorted(repr(x) for x in c)) + "}")
+        else:
+            parts.append(repr(c))
+    return hashlib.sha1("|".join(parts).encode("utf-8", "surrogatepass")).hexdigest()[:10]
 
 
 def _canon(v, depth, seen):
@@ -19,10 +37,39 @@ def _canon(v, depth, seen):
         return f"E:{type(v).__qualname__}.{v.name}"
     if isinstance(v, type):
         return f"T:{v.__module__}.{v.__qualname__}"
+    if isinstance(v, types.FunctionType):
+        # closures made at import time by factories carry their state in cells and defaults
+        s = f"F:{v.__module__}.{v.__qualname__}"
+        if LAMBDA_CODE and "<lambda>" in v.__qualname__ and "<locals>" not in v.__qualname__:
+            # code written inside an assignment (lambdas) or made by a factory: part of the state.
+            # Plain functions are code, which per-test coverage already follows.
+            s += ":" + _code(v.__code__)
+        if depth > 0 and id(v) not in seen:
+            seen.add(id(v))
+            try:
+                if v.__closure__:
+                    cells = []
+                    for c in v.__closure__:
+                        try:
+                            cells.append(_canon(c.cell_contents, depth - 1, seen))
+                        except ValueError:
+                            cells.append("<empty>")
+                    s += "|c(" + ",".join(cells) + ")"
+                if v.__defaults__:
+                    s += "|d" + _canon(v.__defaults__, depth - 1, seen)
+                if v.__kwdefaults__:
+                    s += "|k" + _canon(v.__kwdefaults__, depth - 1, seen)
+            finally:
+                seen.discard(id(v))
+        return s
+    if isinstance(v, functools.partial):
+        return "FP:" + _canon(v.func, depth, seen) + _canon(v.args, depth - 1, seen) + _canon(v.keywords, depth - 1, seen)
     if isinstance(v, _FUNCS):
         return f"F:{getattr(v, '__module__', '')}.{getattr(v, '__qualname__', '')}"
     if isinstance(v, types.ModuleType):
         return f"M:{v.__name__}"
+    if isinstance(v, logging.Logger):
+        return f"L:{v.name}"  # its caches fill up at run time
     if isinstance(v, re.Pattern):
         return f"R:{v.pattern!r}:{v.flags}"
     if isinstance(v, (classmethod, staticmethod)):
@@ -64,13 +111,13 @@ def _class(out, mn, name, v, depth):
     for a, av in list(vars(v).items()):
         if a in ("__dict__", "__weakref__", "__doc__", "__module__", "__qualname__"):
             continue
-        if isinstance(av, _FUNCS):
+        if isinstance(av, _FUNCS) and not isinstance(av, types.FunctionType):
             continue
         if (isinstance(av, type) and av.__module__ == mn and depth < 3
                 and av.__qualname__.startswith(v.__qualname__ + ".")):
             _class(out, mn, f"{name}.{a}", av, depth + 1)  # nested class (Dialect.Tokenizer ...)
             continue
-        out[f"{mn}:{name}.{a}"] = _h(_canon(av, 8, set()))
+        out[f"{mn}:{name}.{a}"] = _h(_canon(av, 40, set()))
     out[f"{mn}:{name}"] = _h("T:" + ",".join(b.__module__ + "." + b.__qualname__ for b in v.__mro__))
 
 
@@ -87,9 +134,9 @@ def snapshot(prefixes=("sqlglot", "tests"), mods=None):
             if isinstance(v, type) and v.__module__ == mn:
                 _class(out, mn, name, v, 0)
             elif isinstance(v, _FUNCS):
-                out[f"{mn}:{name}"] = _h(_canon(v, 1, set()) + _canon(getattr(v, "__defaults__", None), 4, set()) + _canon(getattr(v, "__kwdefaults__", None), 4, set()))
+                out[f"{mn}:{name}"] = _h(_canon(v, 6, set()))
             else:
-                out[f"{mn}:{name}"] = _h(_canon(v, 8, set()))
+                out[f"{mn}:{name}"] = _h(_canon(v, 40, set()))
     return out
 
 
@@ -130,6 +177,8 @@ if __name__ == "__main__":
     bad = import_everything(repo)
     t1 = time.process_time()
     snap = snapshot()
+    LAMBDA_CODE = True
+    snapl = snapshot()
     t2 = time.process_time()
-    json.dump({"bad": bad, "snap": snap}, open(sys.argv[2], "w"))
+    json.dump({"bad": bad, "snap": snap, "snapl": snapl}, open(sys.argv[2], "w"))
     print("import", round(t1 - t, 2), "snap", round(t2 - t1, 2), "keys", len(snap), "bad", bad[:5], file=sys.stderr)

@@ -87,6 +87,7 @@ class Change:
         self.itime = set()
         self.it_fallback = 0
         self.diffpaths = set()
+        self.it_keys = set()
         self.diff_fallback = 0
         for fp in self.files:
             self._one(fp)
@@ -157,8 +158,15 @@ class Change:
             self.itime.add(path)
             self.notes.append(f"import-time {path}")
             self.it_fallback |= self._structural_reach(path, dict(info, attrs=None, scopes=[]))
+            mod = path[:-3].replace("/", ".")
+            if mod.endswith(".__init__"):
+                mod = mod[:-9]
             for q, k, firstline in info["changed_funcs"]:
                 self.cand |= ix.line_set(path, -firstline)
+                # the function object itself differs (new code): runtime reach covers its callers
+                parts = q.split(".<locals>.")
+                for j in range(1, len(parts) + 1):  # enclosing functions hold its code too
+                    self.it_keys.add(f"{mod}:{'.<locals>.'.join(parts[:j])}")
             for ln in spans:
                 self.precise |= ix.line_set(path, ln)
                 self.cand |= ix.line_set(path, ln)
@@ -252,6 +260,8 @@ class Change:
     def apply_itime(self, keys):
         """Reach of an import-time change given the module-state keys that differ (None = unknown)."""
         ix = self.ix
+        if keys is not None:
+            keys = [k for k in keys if k not in self.it_keys]
         n = len(ix.ids)
         if keys is None and self.itime:
             # the patched import failed or could not be checked: anything may break
