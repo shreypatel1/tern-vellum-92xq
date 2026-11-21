@@ -61,6 +61,7 @@ def bits(b):
     return out
 
 
+DIFF_STRUCTURAL = os.environ.get("BR_DIFF_STRUCT", "1") == "1"
 TPC_FIXTURES = {"tpch": "tests/fixtures/optimizer/tpc-h/tpc-h.sql",
                 "tpcds": "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
 
@@ -85,6 +86,8 @@ class Change:
         self.spans = {}
         self.itime = set()
         self.it_fallback = 0
+        self.diffpaths = set()
+        self.diff_fallback = 0
         for fp in self.files:
             self._one(fp)
 
@@ -125,6 +128,14 @@ class Change:
             self.reimport.add(path)
             self.notes.append(f"structural {path}")
             reach = self._structural_reach(path, info)
+            if (not info["error"] and info.get("attrs") and DIFF_STRUCTURAL
+                    and not any(n.startswith("attr-reach") or n.startswith("expr-class") for n in self.notes)):
+                # only module/class-level assignments changed: their whole effect is the module
+                # state after import, so diff that state and follow the names that moved
+                self.diffpaths.add(path)
+                self.diff_fallback |= reach
+                self.notes.append("state-diff pending")
+                return
             self.cand |= reach
             # statement-level reach for blind decisions: also whole-file (conservative)
             self.precise |= reach
@@ -242,13 +253,13 @@ class Change:
         """Reach of an import-time change given the module-state keys that differ (None = unknown)."""
         ix = self.ix
         n = len(ix.ids)
-        if keys is None:
+        if keys is None and self.itime:
             # the patched import failed or could not be checked: anything may break
             self.notes.append("itime-unknown -> all tests")
             reach = (1 << n) - 1
-        elif len(keys) > 60:
-            self.notes.append(f"itime-fallback {len(keys)}")
-            reach = self.it_fallback
+        elif keys is None or len(keys) > 60:
+            self.notes.append(f"diff-fallback {None if keys is None else len(keys)}")
+            reach = self.it_fallback | self.diff_fallback
         else:
             self.notes.append(f"itime-diff {sorted(keys)[:6]}")
             reach = 0
@@ -263,7 +274,7 @@ class Change:
                 else:
                     b = ix.name_set(rest.rsplit(".", 1)[-1])
                     if b.bit_count() > n // 4:
-                        reach = self.it_fallback
+                        reach = self.it_fallback | self.diff_fallback
                         self.notes.append(f"itime-broad {k}")
                         break
                 reach |= b

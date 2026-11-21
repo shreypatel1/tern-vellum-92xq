@@ -25,6 +25,9 @@ def _safe(fn):
         return "ERR:" + e.__class__.__name__
 
 
+_PAIRS = {}
+
+
 def fingerprints(which, idxs=None):
     from sqlglot import parse_one, transpile, serde
     from sqlglot.optimizer import optimize
@@ -32,7 +35,9 @@ def fingerprints(which, idxs=None):
     from tests.helpers import load_sql_fixture_pairs
     import tests.helpers as H
     schema = H.TPCH_SCHEMA if which == "tpch" else H.TPCDS_SCHEMA
-    pairs = list(load_sql_fixture_pairs(FIXTURE[which]))
+    if which not in _PAIRS:
+        _PAIRS[which] = list(load_sql_fixture_pairs(FIXTURE[which]))
+    pairs = _PAIRS[which]
     out = {}
     for i, (meta, sql, optimized) in enumerate(pairs):
         if idxs is not None and i not in idxs:

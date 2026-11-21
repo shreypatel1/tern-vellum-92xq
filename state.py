@@ -37,7 +37,10 @@ def _canon(v, depth, seen):
     try:
         d = depth - 1
         if isinstance(v, (list, tuple)):
-            return type(v).__name__ + "[" + ",".join(_canon(x, d, seen) for x in v) + "]"
+            items = [_canon(x, d, seen) for x in v]
+            if v and all(isinstance(x, type) for x in v):
+                items.sort()  # isinstance() tuples: order carries no meaning (often built from sets)
+            return type(v).__name__ + "[" + ",".join(items) + "]"
         if isinstance(v, (set, frozenset)):
             return type(v).__name__ + "{" + ",".join(sorted(_canon(x, d, seen) for x in v)) + "}"
         if isinstance(v, dict):
@@ -57,22 +60,32 @@ def _h(s):
     return hashlib.sha1(s.encode("utf-8", "surrogatepass")).hexdigest()[:12]
 
 
-def snapshot(prefixes=("sqlglot", "tests")):
+def _class(out, mn, name, v, depth):
+    for a, av in list(vars(v).items()):
+        if a in ("__dict__", "__weakref__", "__doc__", "__module__", "__qualname__"):
+            continue
+        if isinstance(av, _FUNCS):
+            continue
+        if (isinstance(av, type) and av.__module__ == mn and depth < 3
+                and av.__qualname__.startswith(v.__qualname__ + ".")):
+            _class(out, mn, f"{name}.{a}", av, depth + 1)  # nested class (Dialect.Tokenizer ...)
+            continue
+        out[f"{mn}:{name}.{a}"] = _h(_canon(av, 8, set()))
+    out[f"{mn}:{name}"] = _h("T:" + ",".join(b.__module__ + "." + b.__qualname__ for b in v.__mro__))
+
+
+def snapshot(prefixes=("sqlglot", "tests"), mods=None):
     out = {}
     for mn, mod in sorted(sys.modules.items()):
         if mod is None or not any(mn == p or mn.startswith(p + ".") for p in prefixes):
+            continue
+        if mods is not None and mn not in mods:
             continue
         for name, v in list(vars(mod).items()):
             if name.startswith("__") and name.endswith("__"):
                 continue
             if isinstance(v, type) and v.__module__ == mn:
-                for a, av in list(vars(v).items()):
-                    if a in ("__dict__", "__weakref__", "__doc__", "__module__", "__qualname__"):
-                        continue
-                    if isinstance(av, _FUNCS):
-                        continue
-                    out[f"{mn}:{name}.{a}"] = _h(_canon(av, 8, set()))
-                out[f"{mn}:{name}"] = _h("T:" + ",".join(b.__module__ + "." + b.__qualname__ for b in v.__mro__))
+                _class(out, mn, name, v, 0)
             elif isinstance(v, _FUNCS):
                 out[f"{mn}:{name}"] = _h(_canon(v, 1, set()) + _canon(getattr(v, "__defaults__", None), 4, set()) + _canon(getattr(v, "__kwdefaults__", None), 4, set()))
             else:

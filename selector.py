@@ -196,31 +196,34 @@ def fp_failures(fp_ids, ch, ix):
         idxs = {int(i) for i in ref} if q is None else q
         if not idxs:
             continue
-        need = frozenset(idxs)
-        if which not in cache or not need <= cache[which][0]:
-            done = cache[which][0] if which in cache else frozenset()
-            now = dict(cache[which][1]) if which in cache else {}
-            now.update(tpcfp.fingerprints(which, need - done))
-            cache[which] = (done | need, now)
-        now = cache[which][1]
-        if q is None:
-            if set(now) != {int(i) for i in ref}:
-                bad.add(tid); continue
-            if any(len(r) > 3 for r in now.values()) and any(
-                    bool(now[i][3]) != ((ix.tpcres.get(which, {}).get(str(i)) or ["NONE"])[0] != "NONE") for i in now):
-                bad.add(tid); continue
+        now = cache.setdefault(which, {})
+
+        def fpr(i):
+            # fingerprint lazily, one query at a time, so a failing query stops the work early
+            if i not in now:
+                now.update(tpcfp.fingerprints(which, {i}))
+            return now.get(i)
+        fpr(min(idxs))
+        if len(tpcfp._PAIRS.get(which, ())) != len(ref):
+            bad.add(tid); continue  # queries added/removed in the fixture
         res = ix.tpcres.get(which, {})
         dres = ix.tpcres.get("duck", {})
         phase_b = ch.fp_phase_b(tid)
         execq = {int(i) for i, v in res.items() if v[0] != "NONE"}
         to_exec = set()
         to_duck = set()  # (kind, i)
+
+        def _c(m, i):
+            v = m.get(str(i)) or m.get(i)
+            return v[1] if v else 1.0
         fail = False
-        for i in idxs:
+        for i in sorted(idxs):
             r = ref.get(str(i)) or ref.get(i)
-            n = now.get(i)
+            n = fpr(i)
             if r is None or n is None:
                 fail = True; break
+            if len(n) > 3 and mode == "exec" and bool(n[3]) != (i in execq):
+                fail = True; break  # fixture flipped the query's execute flag
             if mode == "opt":
                 if n[1] != r[1]:
                     to_duck.add(("sql", i))
@@ -238,15 +241,14 @@ def fp_failures(fp_ids, ch, ix):
                 to_duck.add(("sql", i))
             if n[0] != r[0] or phase_b:
                 to_exec.add(i)
+            if 2.5 + sum(_c(res, j) for j in to_exec) + sum(_c(dres.get(f"{which}:{k}", {}), j) for k, j in to_duck) > FP_EXEC_BUDGET:
+                fail = True; break  # re-checking would cost more than scheduling the test
         print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} exec={len(to_exec)} duck={len(to_duck)} fail={fail} phaseB={phase_b}", file=sys.stderr)
         if fail:
             bad.add(tid); continue
         if not to_exec and not to_duck:
             continue
 
-        def _c(m, i):
-            v = m.get(str(i)) or m.get(i)
-            return v[1] if v else 1.0
         est = 2.5 + sum(_c(res, i) for i in to_exec) + sum(_c(dres.get(f"{which}:{k}", {}), i) for k, i in to_duck)
         if est > FP_EXEC_BUDGET:
             bad.add(tid); continue
@@ -282,6 +284,18 @@ def state_diff(ch):
     base = getattr(ch.ix, "state", None)
     if not base or not base.get("snap"):
         return None
+    mods = None
+    if not ch.itime:
+        # only module/class-level assignments changed: just the changed modules and the modules
+        # that (transitively) import them can hold different state
+        todo = [p for p in ch.diffpaths]
+        seen = set(todo)
+        while todo:
+            p = todo.pop()
+            for imp in ch.ix.imports.get(p, []):
+                if imp not in seen:
+                    seen.add(imp); todo.append(imp)
+        mods = {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
     r, w = os.pipe()
     sys.stdout.flush(); sys.stderr.flush()
     pid = os.fork()
@@ -302,8 +316,15 @@ def state_diff(ch):
             os.environ["SKIP_INTEGRATION"] = "0"
             os.chdir(REPO)
             import state
-            bad = state.import_everything(REPO)
-            snap = state.snapshot()
+            if mods is None:
+                bad = state.import_everything(REPO)
+                snap = state.snapshot()
+            else:
+                import importlib
+                bad = list(base["bad"])
+                for m in sorted(mods):
+                    importlib.import_module(m)  # an import error -> no output -> unknown
+                snap = state.snapshot(mods=mods)
             b = json.dumps({"bad": bad, "snap": snap}).encode()
             while b:
                 n = os.write(w, b); b = b[n:]
@@ -332,6 +353,8 @@ def state_diff(ch):
         return None
     noisy = set(base["noisy"])
     old, new = base["snap"], d["snap"]
+    if mods is not None:
+        old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods}
     return sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
 
 
@@ -540,7 +563,7 @@ def main():
         text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="replace").read()
         try:
             ch = analyze.Change(cid, text, REPO, ix)
-            if ch.itime and not ch.unknown:
+            if (ch.itime or ch.diffpaths) and not ch.unknown:
                 ch.apply_itime(state_diff(ch))
         except Exception as e:  # noqa
             log("analysis failed", cid, e)
