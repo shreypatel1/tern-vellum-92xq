@@ -28,8 +28,52 @@ def _safe(fn):
 _PAIRS = {}
 
 
+def _dump(expression):
+    """The pinned commit's sqlglot.serde.dump, frozen here so a patched serde changes what is
+    pickled (the round trip below) but not how the result is fingerprinted."""
+    from sqlglot import expressions as exp
+    i = 0
+    payloads = []
+    stack = [(expression, None, None, False)]
+    while stack:
+        node, index, arg_key, is_array = stack.pop()
+        payload = {}
+        if index is not None:
+            payload["i"] = index
+        if arg_key is not None:
+            payload["k"] = arg_key
+        if is_array:
+            payload["a"] = is_array
+        payloads.append(payload)
+        if hasattr(node, "parent"):
+            klass = node.__class__.__qualname__
+            if node.__class__.__module__ != exp.__name__:
+                klass = f"{node.__module__}.{klass}"
+            payload["c"] = klass
+            if node.type and node.type is not node:
+                payload["t"] = _dump(node.type)
+            if node.comments:
+                payload["o"] = node.comments
+            if node._meta is not None:
+                payload["m"] = node._meta
+            if node.args:
+                for k, vs in reversed(node.args.items()):
+                    if type(vs) is list:
+                        for v in reversed(vs):
+                            stack.append((v, i, k, True))
+                    elif vs is not None:
+                        stack.append((vs, i, k, False))
+        elif type(node) is exp.DType:
+            payload["c"] = "DataType.Type"
+            payload["v"] = node.value
+        else:
+            payload["v"] = node
+        i += 1
+    return payloads
+
+
 def fingerprints(which, idxs=None):
-    from sqlglot import parse_one, transpile, serde
+    from sqlglot import parse_one, transpile
     from sqlglot.optimizer import optimize
     from sqlglot.schema import ensure_schema
     from tests.helpers import load_sql_fixture_pairs
@@ -48,11 +92,11 @@ def fingerprints(which, idxs=None):
         def ex():
             # the test always pickles the parsed query into the pool, executed or not
             e = pickle.loads(pickle.dumps(parse_one(sql)))
-            parts = [json.dumps(serde.dump(e), sort_keys=True, default=str)]
+            parts = [json.dumps(_dump(e), sort_keys=True, default=str)]
             if execute:
                 s = pickle.loads(pickle.dumps(schema))
                 o = optimize(e, ensure_schema(s), leave_tables_isolated=True)
-                parts.append(json.dumps(serde.dump(o), sort_keys=True, default=str))
+                parts.append(json.dumps(_dump(o), sort_keys=True, default=str))
             return "\n".join(parts)
 
         fe = _safe(ex)
