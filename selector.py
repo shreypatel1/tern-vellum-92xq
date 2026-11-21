@@ -551,6 +551,11 @@ def state_diff(ch):
         old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods and k in new}
     keys = sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
     ch.dict_entries = d.get("dicts") or {}
+    if not any(fp.path.startswith("sqlglot/expressions/") for fp in ch.files):
+        # UNITTEST = "unittest"/"pytest" imported when expressions.core is first imported: the
+        # pinned snapshot and the patched import see different test-runner modules loaded, the
+        # tests always run with it True. Only an edit to expressions/ can change it.
+        keys = [k for k in keys if not k.endswith(":UNITTEST")]
     if ch.full_diff and not ch.itime:
         # a module global that only the patched import binds (e.g. names imported under a
         # flipped TYPE_CHECKING guard): the pinned code ran without it, so no code the tests ran
