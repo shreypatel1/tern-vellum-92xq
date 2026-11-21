@@ -813,7 +813,8 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
     has_data = any(not fp.path.endswith(".py") for fp in ch.files)
     only_equiv = (not has_data and not ch.reimport and ch.swap and set(ch.swap) <= ch.equivalent
                   and all(enum_constants(p, ch.equiv_needs.get(p, ())) for p in ch.swap))
-    fpc = [] if only_equiv else [p for p in S if ix.ids[p] in FP_TESTS and ch.fp_eligible(ix.ids[p])]
+    fpc = [] if only_equiv else [p for p in S if ix.ids[p] in FP_TESTS and ch.fp_eligible(ix.ids[p])
+                                 and not (ch.no_run >> p) & 1]
     ch.fpcheck = fpc
     S = [p for p in S if p not in set(fpc)]
     if not S:
@@ -823,7 +824,7 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
         for p in S:
             if ix.ids[p] in SHRINK and shrink_ok(ch, ix.ids[p]):
                 per[p] = SHRINK[ix.ids[p]][2]
-    forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail]
+    forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail or (ch.no_run >> p) & 1]
     ch.case_filters = {}
     if CASECOV:
         for p in S:

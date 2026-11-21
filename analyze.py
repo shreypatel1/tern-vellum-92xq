@@ -1,9 +1,15 @@
 """Work out, for one patch, which tests could be affected and how."""
 import os
+import sys
 import pickle
 import zlib
 
 import patchinfo
+
+# the lazily filled dialect registry (sqlglot/dialects/__init__.py) and the class map it feeds
+REGISTRY = {"sqlglot.dialects:DIALECTS", "sqlglot.dialects:MODULE_BY_DIALECT",
+            "sqlglot.dialects:MODULE_BY_ATTRIBUTE", "sqlglot.dialects:DIALECT_MODULE_NAMES",
+            "sqlglot.dialects:__all__", "sqlglot.dialects.dialect:_Dialect._classes"}
 
 
 class Index:
@@ -120,6 +126,7 @@ class Change:
         self.itime = set()
         self._exact = {}
         self.it_fallback = 0
+        self.no_run = 0       # tests to schedule rather than run (a run here cannot show the failure)
         self.diffpaths = set()
         self.it_keys = set()
         self.diff_fallback = 0
@@ -399,6 +406,20 @@ class Change:
         else:
             self.notes.append(f"itime-diff {sorted(keys)[:6]}")
             reach = 0
+            reg = [k for k in keys if k in REGISTRY]
+            if reg:
+                # the dialect registry: dialect modules are imported lazily on first use and the
+                # result is cached, so per-test reads of it are not seen. The tests that used a
+                # dialect whose entry changed are its reach.
+                rb = self.registry_reach(reg)
+                if rb is None:
+                    self.notes.append("registry change -> structural reach")
+                    rb = self.it_fallback | self.diff_fallback | self._structural_reach(
+                        "sqlglot/dialects/__init__.py", {"attrs": None, "scopes": []})
+                reach |= rb
+                # a patched run in our process still finds every dialect already imported
+                self.no_run |= rb
+                keys = [k for k in keys if k not in set(reg)]
             for k in keys:
                 mn, rest = k.split(":", 1)
                 if mn == "tests" or mn.startswith("tests."):
@@ -423,9 +444,13 @@ class Change:
                     if u is not None:
                         b &= u
                 reach |= b
+                if os.environ.get("BR_KDEBUG"):
+                    print("KDEBUG", self.cid, k, b.bit_count(), file=sys.stderr)
             fb = self.it_fallback | self.diff_fallback
-            if reach.bit_count() > n // 4 and fb.bit_count() < reach.bit_count():
-                self.notes.append("itime-broad")
+            # (not for code run at import time: its fallback is only the edited file's reach,
+            # while what it computed can reach any user of the module state it built)
+            if reach.bit_count() > n // 4 and fb.bit_count() < reach.bit_count() and not self.itime:
+                self.notes.append(f"itime-broad {reach.bit_count()}->{fb.bit_count()}")
                 reach = fb
         self.cand |= reach
         self.precise |= reach
@@ -484,6 +509,49 @@ class Change:
         self.precise |= b
         self.notes.append(f"import fails only in {sorted(nb)[:4]}")
         return True
+
+    def registry_reach(self, reg):
+        """Tests that used a dialect whose registry entry changed (None if not determinable)."""
+        try:
+            import keyuse
+        except Exception:  # noqa
+            return None
+        de = getattr(self, "dict_entries", {})
+        mods = set()
+        for k in reg:
+            if k == "sqlglot.dialects:DIALECTS":
+                continue  # the dicts below are built from it
+            old = keyuse.resolve(k)
+            new = de.get(k)
+            if type(old) is not dict or new is None:
+                return None
+            oe = keyuse.entries(old)
+            if oe is None:
+                return None
+            for x in set(oe) | set(new):
+                if oe.get(x) == new.get(x):
+                    continue
+                name = x.strip("'\"")
+                v = old.get(name) if isinstance(old.get(name), str) else None
+                mods.add(v or name.lower())
+        if not mods and "sqlglot.dialects:DIALECTS" in reg:
+            return None
+        ix = self.ix
+        b = 0
+        for m in mods:
+            for kk, bits in ix.clsuse.items():
+                mn = kk.split(":", 1)[0]
+                if mn.rsplit(".", 1)[-1] == m and mn.split(".")[:2] in (["sqlglot", "dialects"], ["sqlglot", "parsers"],
+                                                                       ["sqlglot", "generators"], ["sqlglot", "tokenizers"],
+                                                                       ["sqlglot", "typing"]):
+                    b |= bits
+            b |= self._dialect_users(f"sqlglot/dialects/{m}.py")
+            pre = f"tests/dialects/test_{m}.py::"
+            for i, tid in enumerate(ix.ids):
+                if tid.startswith(pre):
+                    b |= 1 << i
+        self.notes.append(f"registry {sorted(mods)} -> {b.bit_count()}")
+        return b
 
     def key_reach(self, k):
         """Tests that read the entries of dict constant k that the patch changed (None if the

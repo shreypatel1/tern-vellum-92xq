@@ -107,6 +107,14 @@ def _h(s):
     return hashlib.sha1(s.encode("utf-8", "surrogatepass")).hexdigest()[:12]
 
 
+def _named(c):
+    """True if class c is reachable from its module by its qualified name."""
+    o = sys.modules.get(c.__module__)
+    for part in c.__qualname__.split("."):
+        o = getattr(o, part, None) if o is not None else None
+    return o is c
+
+
 def _class(out, mn, name, v, depth):
     for a, av in list(vars(v).items()):
         if a in ("__dict__", "__weakref__", "__doc__", "__module__", "__qualname__"):
@@ -116,6 +124,12 @@ def _class(out, mn, name, v, depth):
         if (isinstance(av, type) and av.__module__ == mn and depth < 3
                 and av.__qualname__.startswith(v.__qualname__ + ".")):
             _class(out, mn, f"{name}.{a}", av, depth + 1)  # nested class (Dialect.Tokenizer ...)
+            continue
+        if isinstance(av, type) and depth < 3 and str(av.__module__).startswith("sqlglot") and not _named(av):
+            # a class made at import time (type("Tokenizer", bases, {}) for a dialect without
+            # its own): only reachable through this attribute, so its state is recorded here
+            out[f"{mn}:{name}.{a}"] = _h(_canon(av, 40, set()))
+            _class(out, mn, f"{name}.{a}", av, depth + 1)
             continue
         out[f"{mn}:{name}.{a}"] = _h(_canon(av, 40, set()))
     out[f"{mn}:{name}"] = _h("T:" + ",".join(b.__module__ + "." + b.__qualname__ for b in v.__mro__))
