@@ -422,6 +422,24 @@ class Change:
         self.cand |= reach
         self.precise |= reach
 
+    def _all_dialect_tests(self):
+        ix = self.ix
+        if getattr(ix, "_alld", None) is None:
+            dial = [b for k, b in ix.clsuse.items() if k.startswith("sqlglot.dialects.") and k != "sqlglot.dialects.dialect:Dialect"]
+            cnt = {}
+            for b in dial:
+                i = 0
+                while b:
+                    if b & 1:
+                        cnt[i] = cnt.get(i, 0) + 1
+                    b >>= 1
+                    i += 1
+            ix._alld = 0
+            for i, c in cnt.items():
+                if c >= 0.8 * len(dial):
+                    ix._alld |= 1 << i
+        return ix._alld
+
     def import_fail_reach(self, extra=0):
         """The patched import failed. If only one dialect's own modules (and test modules) fail to
         import, the tests that can see it are the structural reach (which covers that dialect's
@@ -448,6 +466,9 @@ class Change:
                 # whoever used that dialect (or ran its code) loads the broken module
                 path = m.replace(".", "/") + ".py"
                 b |= self._dialect_users(path) | ix.file_any(path)
+        # and every test that loads (nearly) all dialects, e.g. by iterating over Dialects: the
+        # per-class use map does not always see it touch one particular dialect
+        b |= self._all_dialect_tests()
         for i, tid in enumerate(ix.ids):
             if tid.startswith(tuple(test_mods)) if test_mods else False:
                 b |= 1 << i
