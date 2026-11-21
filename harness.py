@@ -46,7 +46,7 @@ def import_all(test_ids):
             bad.add(f)
     return bad
 
-def run_tests(test_ids, timeout_for=lambda tid: 60, stop_on_fail=False):
+def run_tests(test_ids, timeout_for=lambda tid: 60, stop_on_fail=False, before=None):
     """Run tests grouped by class (setUpClass once per class). Returns set of failing ids."""
     failed = set()
     old = signal.signal(signal.SIGALRM, _alarm)
@@ -74,6 +74,8 @@ def run_tests(test_ids, timeout_for=lambda tid: 60, stop_on_fail=False):
             for tid in tids:
                 meth = tid.rsplit("::", 1)[1]
                 r = Result()
+                if before is not None:
+                    before(tid)
                 try:
                     signal.setitimer(signal.ITIMER_REAL, max(0.5, float(timeout_for(tid))))
                     cls(meth).run(r)

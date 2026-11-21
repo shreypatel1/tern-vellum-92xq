@@ -679,7 +679,16 @@ def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None
                 except Exception:  # noqa
                     failed.add(tid)
                     run_ids = [t for t in run_ids if t != tid]
-        failed |= harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
+        before = None
+        casesel = getattr(ch, "casesel", None)
+        if casesel and any(t in casesel for t in run_ids):
+            import casecov
+            casecov.install()
+
+            def before(t):
+                casecov.FILTER.clear()
+                casecov.FILTER.update(casesel.get(t, {}))
+        failed |= harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT), before=before)
         os.write(wfd, json.dumps(sorted(failed)).encode())
     except BaseException as e:  # noqa
         import traceback
@@ -764,6 +773,40 @@ def enum_constants(path, exprs):
         return False
 
 
+_CASECOV = []
+
+
+def casecov_map():
+    if not _CASECOV:
+        import casecov
+        _CASECOV.append(casecov.load(os.path.join(HERE, "casecov.bin")))
+    return _CASECOV[0]
+
+
+def case_selection(ch, tid):
+    """Fixture cases of a fixture-driven test that a function-body edit reaches, as
+    {fixture: set(case indices)}; None when the whole test must run (or nothing is gained).
+    Only for edits that are all function bodies in sqlglot/: their reach is the changed lines,
+    and a case that never ran one of them runs exactly the pinned code."""
+    e = casecov_map().get(tid)
+    if not e or e["fail"]:
+        return None
+    reached = {f: 0 for f in e["fx"]}
+    base_hit = False
+    for path, sp in ch.spans.items():
+        bl = set(e["base"].get(path, ()))
+        m = e["m"].get(path, {})
+        for ln in sp:
+            if ln in bl:
+                base_hit = True
+            for f, mask in m.get(ln, {}).items():
+                reached[f] |= mask
+    n = sum(v.bit_count() for v in reached.values())
+    if n >= sum(e["fx"].values()) or (n == 0 and not base_hit):
+        return None  # everything reached, or reached through something other than these lines
+    return {f: {k for k in range(e["fx"][f]) if (mask >> k) & 1} for f, mask in reached.items()}
+
+
 def plan_commit(ch, ix, pos2num, ms, per, setup):
     """Return (run_positions, blind_positions, label)."""
     if ch is None or ch.unknown:
@@ -782,6 +825,19 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
         for p in S:
             if ix.ids[p] in SHRINK and shrink_ok(ch, ix.ids[p]):
                 per[p] = SHRINK[ix.ids[p]][2]
+    ch.casesel = {}
+    if (ch.swap and not ch.reimport and not ch.itime and not ch.diffpaths
+            and all(fp.path.startswith("sqlglot/") and fp.path in ch.swap for fp in ch.files)):
+        for p in S:
+            tid = ix.ids[p]
+            sel = case_selection(ch, tid)
+            if sel is not None:
+                e = casecov_map()[tid]
+                frac = max(0.5, sum(len(v) for v in sel.values())) / sum(e["fx"].values())
+                if not ch.casesel:
+                    per = list(per)
+                per[p] = per[p] * frac
+                ch.casesel[tid] = sel
     forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail]
     runnable = [p for p in S if p not in set(forced)]
     py_changed = bool(ch.swap or ch.reimport)
