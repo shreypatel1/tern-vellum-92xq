@@ -174,6 +174,7 @@ FP_TESTS = {
 }
 
 
+FP_MIN_GAIN = float(os.environ.get("BR_FP_MIN_GAIN", "3.0"))
 FP_EXEC_BUDGET = float(os.environ.get("BR_FP_EXEC", "13.0"))
 
 
@@ -545,7 +546,17 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
         est = run_cost(rs) + blind_c + fail_extra
         if best is None or est < best[0]:
             best = (est, rs, bs, run_cost(rs))
-    return best[1], best[2], f"est={best[0]:.2f} runest={best[3]:.2f}", []
+    rs, bs = best[1], best[2]
+    if fpc and not rs:
+        # checking the TPC tests costs CPU; only worth it if leaving them out shrinks the schedule
+        base = {pos2num[p]: ms[pos2num[p]] for p in bs}
+        with_fp = dict(base)
+        with_fp.update({pos2num[p]: ms[pos2num[p]] for p in fpc})
+        gain = pack_cost(with_fp) - pack_cost(base)
+        if gain < FP_MIN_GAIN:
+            ch.fpcheck = []
+            bs = list(bs) + list(fpc)
+    return rs, bs, f"est={best[0]:.2f} runest={best[3]:.2f}", []
 
 
 def main():
@@ -563,6 +574,10 @@ def main():
         text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="replace").read()
         try:
             ch = analyze.Change(cid, text, REPO, ix)
+            if ch.itime and not ch.unknown and ch.precise.bit_count() > len(ix.ids) // 2:
+                # the changed code already runs in most tests: schedule everything, skip the checks
+                ch.unknown = True
+                ch.notes.append("broad import-time change -> all tests")
             if (ch.itime or ch.diffpaths) and not ch.unknown:
                 ch.apply_itime(state_diff(ch))
         except Exception as e:  # noqa
