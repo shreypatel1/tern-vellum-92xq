@@ -27,10 +27,12 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-# tests that we never run inline (they spawn subprocesses or measure memory)
+# tests that we never run inline (they spawn subprocesses). test_generator_memory is run: in a
+# child with a frozen heap it costs ~0.4 s CPU against 6.7 s recorded, and a real leak (>= one
+# object per generator() call, checked over 1000 calls against a 1 KB bound) shows there too;
+# a spurious in-process failure only schedules it.
 NEVER_RUN = {
     "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
-    "tests/test_generator.py::TestGenerator::test_generator_memory",
 }
 BLIND_CPU = float(os.environ.get("BR_BLIND_CPU", "2.5"))  # run-cost above which we include instead of running
 WORKER_COST = 2000
@@ -51,7 +53,12 @@ def pack(durs):
         return []
     items = sorted(durs.items(), key=lambda kv: -kv[1])
     best = None
+    top = items[0][1]
+    total = sum(d for _, d in items)
     for k in range(1, min(8, len(items)) + 1):
+        # no packing on k workers beats this bound, so skipping k cannot change the result
+        if best is not None and max(top, -(-total // k)) + WORKER_COST * k >= best[0]:
+            continue
         loads = [0] * k
         ws = [[] for _ in range(k)]
         for n, d in items:
@@ -571,6 +578,9 @@ def main():
     os.environ["SKIP_INTEGRATION"] = "0"
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ix = analyze.Index(os.path.join(HERE, "index.bin"))
+    # recorded as failing only because the map builder's line monitoring allocates under
+    # tracemalloc; it passes in our harness at the pinned commit, so it can be run like any test
+    ix.basefail.discard("tests/test_generator.py::TestGenerator::test_generator_memory")
     setup, per = class_costs(ix)
     num_of = {t["id"]: t["number"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}

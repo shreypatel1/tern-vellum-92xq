@@ -20,6 +20,12 @@ class Index:
         self.inst = d.get("inst", {})
         self.exprclasses = set(d.get("exprclasses", ()))
         self.importtime = {k: set(v) for k, v in d.get("importtime", {}).items()}
+        ic = d.get("importcalls")
+        self.importcalls = None if ic is None else {k: set(v) for k, v in ic.items()}
+        # per Dialect class: tests that read an attribute of it or of an instance (MRO-expanded),
+        # and the source files each dialect's classes come from
+        self.clsuse = d.get("clsuse") or {}
+        self.dialect_mods = {k: set(v) for k, v in d.get("dialect_mods", {}).items()}
         self.subcov = d.get("subcov", {})
         self.tpcfp = d.get("tpcfp", {})
         self.state = d.get("state", {})
@@ -128,6 +134,17 @@ class Change:
         if info["error"] or info["structural"]:
             self.reimport.add(path)
             self.notes.append(f"structural {path}")
+            dflt = info.get("default_funcs")
+            called = (ix.importcalls or {}).get(path)
+            if dflt and not info["error"] and called is not None and not any(fl in called for _, fl in dflt):
+                # only argument defaults of defs changed and none of them runs during import:
+                # the tests that call them are the reach (run with a patched re-import)
+                self.notes.append(f"default-args {[q for q, _ in dflt]}")
+                for _, fl in dflt:
+                    b = ix.line_set(path, -fl)
+                    self.cand |= b
+                    self.precise |= b
+                return
             reach = self._structural_reach(path, info)
             if (not info["error"] and info.get("attrs") and DIFF_STRUCTURAL
                     and not any(n.startswith("attr-reach") or n.startswith("expr-class") for n in self.notes)):
@@ -150,7 +167,13 @@ class Change:
             lines.add(p)
         spans = patchinfo.stmt_spans_tree(info["old_tree"], lines)
         it = ix.importtime.get(path, set())
-        if spans & it:
+        body_only = self._called_only_at_runtime(path, info)
+        if body_only is not None:
+            # no changed function/lambda body is entered while modules are imported: the change
+            # acts only when called, so narrow statement spans to the changed bodies (a lambda's
+            # enclosing statement is the whole class-level dict it sits in)
+            spans = {ln for ln in spans if any(a <= ln <= b for a, b in body_only)}
+        if body_only is None and spans & it:
             # the changed code runs while modules are imported (metaclass, class-body helper):
             # its effect is baked into classes, so treat it like a structural change
             # (decided later by diffing module state after a patched import; see apply_itime)
@@ -189,6 +212,35 @@ class Change:
         for ln in spans:
             self.precise |= ix.line_set(path, ln)
 
+    def _called_only_at_runtime(self, path, info):
+        """Line ranges of the changed functions if none of them is called while modules are
+        imported (per the index's import-time call map), else None."""
+        ic = self.ix.importcalls
+        if ic is None or info["structural"] or not info["changed_funcs"] or "old_tree" not in info:
+            return None
+        called = ic.get(path, set())
+        nodes = patchinfo._functions(info["old_tree"])
+        ranges = []
+        for q, k, firstline in info["changed_funcs"]:
+            node = nodes.get((q, k))
+            if node is None or firstline in called or patchinfo._first_line(node) != firstline:
+                return None
+            ranges.append((firstline, node.end_lineno))
+        return ranges
+
+    def class_users(self, mod, qual):
+        """Tests that touched dialect class mod:qual (None if it is not a recorded dialect class)."""
+        return self.ix.clsuse.get(f"{mod}:{qual}")
+
+    def _dialect_users(self, path):
+        """Tests that used a dialect built from this file (its classes or what they import)."""
+        ix = self.ix
+        b = 0
+        for k, files in ix.dialect_mods.items():
+            if path in files and k != "sqlglot.dialects.dialect:Dialect":
+                b |= ix.clsuse.get(k, 0)
+        return b
+
     def _structural_reach(self, path, info):
         ix = self.ix
         scopes = info.get("scopes") or []
@@ -210,6 +262,16 @@ class Change:
             b = 0
             for a in attrs:
                 b |= ix.name_set(a)
+            # constants of dialect classes: only tests that read attributes of that class (or of
+            # an instance of it or a subclass) can see the new value
+            mod = path[:-3].replace("/", ".")
+            users = [self.class_users(mod, q) if q else None for q in scopes]
+            if scopes and all(u is not None for u in users):
+                c = 0
+                for u in users:
+                    c |= u
+                self.notes.append(f"class-use {scopes} {b.bit_count()}->{(b & c).bit_count()}")
+                b &= c
             return b
         reach = ix.file_any(path)
         d, base = os.path.split(path)
@@ -222,6 +284,11 @@ class Change:
         for imp in ix.imports.get(path, []):
             if os.path.dirname(imp) == d and d == "sqlglot/dialects" and not imp.endswith("__init__.py"):
                 reach |= ix.file_any(imp)
+        # dialects built from this file: every test that used one, even one whose own code never
+        # ran (pure-configuration dialects such as Materialize, reached only through the dialect)
+        if len(parts) == 2 and parts[0] == "sqlglot" and parts[1] in (
+                "dialects", "generators", "parsers", "tokenizers", "typing"):
+            reach |= self._dialect_users(path)
         limit = len(ix.ids) // 4
         for n in info.get("names", ()):
             b = ix.name_set(n)
@@ -283,6 +350,10 @@ class Change:
                             b |= 1 << i
                 else:
                     b = ix.name_set(rest.rsplit(".", 1)[-1])
+                    # state of a dialect class (or a class nested in one): only its users see it
+                    u = self.class_users(mn, rest.split(".", 1)[0]) if "." in rest else None
+                    if u is not None:
+                        b &= u
                     if b.bit_count() > n // 4:
                         reach = self.it_fallback | self.diff_fallback
                         self.notes.append(f"itime-broad {k}")

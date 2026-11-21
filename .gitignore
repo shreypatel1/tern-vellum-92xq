@@ -5,3 +5,4 @@ Dockerfile.local
 runforce.sh
 output.jsonl
 __pycache__/
+index.bin.*

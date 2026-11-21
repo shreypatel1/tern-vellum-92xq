@@ -436,6 +436,30 @@ def _assign_targets(node):
     return None
 
 
+def _no_defaults_dump(fn):
+    """Dump of a def with its body blanked and argument default values removed."""
+    import copy
+    f = copy.deepcopy(fn)
+    f.args.defaults = []
+    f.args.kw_defaults = []
+    return _dump(_Blank().visit(f))
+
+
+def _doc_stripped(unit):
+    """Dump of a unit (kind, node) with every module/class/function docstring removed."""
+    import copy
+    node = unit[1]
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+        return (unit[0], "DOC")  # a bare string statement: a class/module docstring or a no-op
+    node = copy.deepcopy(node)
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = n.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+                n.body = b[1:]
+    return (unit[0], _dump(node))
+
+
 def classify_fast(old_text, new_text, removed, inserts):
     """Same contract as classify_py, plus 'old_tree'. Falls back to classify_py when the
     change does not line up unit-for-unit."""
@@ -460,11 +484,29 @@ def classify_fast(old_text, new_text, removed, inserts):
            "attrs": None, "scopes": [], "old_tree": old_t, "units": (ou, nu, diff)}
     if not diff:
         return res
+    if all(_doc_stripped(ou[i][1]) == _doc_stripped(nu[i][1]) for i in diff):
+        # only docstrings changed: no collected test reads __doc__ (doctests are not collected)
+        res["same"] = True
+        res["docstring"] = True
+        return res
     struct = [i for i in diff if _unit_dump(ou[i][1], True) != _unit_dump(nu[i][1], True)]
     of, nf = _functions(old_t), _functions(new_t)
     if set(of) != set(nf):
         struct = struct or diff
     if struct:
+        # every structural difference is in default values of a def's arguments (bodies may differ
+        # too): only calls of those functions can see it
+        dflt = []
+        for i in struct:
+            a, b = ou[i][1][1], nu[i][1][1]
+            if (ou[i][1][0] == "stmt" and isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and type(a) is type(b) and _no_defaults_dump(a) == _no_defaults_dump(b)):
+                dflt.append((f"{ou[i][0]}.{a.name}" if ou[i][0] else a.name, _first_line(a)))
+            else:
+                dflt = None
+                break
+        if dflt:
+            res["default_funcs"] = dflt
         names, attrs, scopes = set(), set(), set()
         only_assign = True
         for i in struct:

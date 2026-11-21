@@ -28,6 +28,10 @@ Picks the sqlglot tests a patch can break and splits them over up to 8 workers.
 
 - `selector.py` entry point, `analyze.py` reach, `patchinfo.py` diff + AST classification,
   `harness.py` unittest runner matching pytest's pass/fail rules.
-- `tools/build_maps.py`, `tools/names.py`, `tools/build_index.py` rebuild `index.bin`.
+- `tools/build_maps.py`, `tools/names.py`, `tools/build_index.py` rebuild `index.bin`;
+  `tools/build_importcalls.py` then adds which functions run during import, and
+  `tools/build_clsuse.py` adds, per test, the dialect classes it touched (and the
+  tokenizer/parser/generator classes only reachable through them), used to narrow edits
+  to one dialect's constants and to widen structural edits to pure-configuration dialects.
 
 MIT licensed.
