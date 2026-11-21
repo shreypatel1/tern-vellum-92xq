@@ -53,7 +53,27 @@ imports = json.load(open(NJ.replace(".json", "_imports.json")))
 import os as _os
 exprclasses = json.load(open(RAW + ".exprclasses")) if _os.path.exists(RAW + ".exprclasses") else []
 importtime = {k: sorted(v) for k, v in json.load(open(RAW + ".importtime")).items()} if _os.path.exists(RAW + ".importtime") else {}
-data = {"importtime": importtime, "exprclasses": exprclasses, "inst": {k: sid(b) for k, b in inst.items()}, "runtime_only": runtime_only, "names": names, "imports": imports, "ids": [t["id"] for t in tests], "cpu": cpu, "basefail": basefail, "sets": sets, "lines": lines, "opened": op}
+subcov = {}
+SUB = _os.environ.get("SUBCOV")
+if SUB:
+    for f in glob.glob(SUB + ".[0-9]"):
+        for l in open(f):
+            d = json.loads(l)
+            e = subcov.setdefault(d["id"], {"n": 0, "lines": {}, "blines": {}})
+            for fn, lns in d.get("blines", {}).items():
+                e["blines"].setdefault(fn, set()).update(lns)
+            e["n"] = max(e["n"], d["i"] + 1)
+            for fn, lns in d["lines"].items():
+                m = e["lines"].setdefault(fn, {})
+                for ln in lns:
+                    m[ln] = m.get(ln, 0) | (1 << d["i"])
+for e in subcov.values():
+    e["blines"] = {k: sorted(v) for k, v in e["blines"].items()}
+FP = _os.environ.get("TPCFP")
+tpcfp = json.load(open(FP)) if FP else {}
+ST = _os.environ.get("STATE")
+state = json.load(open(ST)) if ST else {}
+data = {"state": state, "tpcfp": tpcfp, "subcov": subcov, "importtime": importtime, "exprclasses": exprclasses, "inst": {k: sid(b) for k, b in inst.items()}, "runtime_only": runtime_only, "names": names, "imports": imports, "ids": [t["id"] for t in tests], "cpu": cpu, "basefail": basefail, "sets": sets, "lines": lines, "opened": op}
 raw = pickle.dumps(data, protocol=5)
 open(OUT, "wb").write(zlib.compress(raw, 9))
 print("files", len(lines), "entries", sum(len(m) for m in lines.values()), "sets", len(sets), "bytes", len(raw), "->", len(zlib.compress(raw, 9)))

@@ -98,10 +98,12 @@ def run_tests(test_ids, timeout_for=lambda tid: 60, stop_on_fail=False):
 
 class InlineExecutor:
     """Drop-in for ProcessPoolExecutor that runs work synchronously in this process."""
+    PICKLE_INIT = True
+
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         if initializer:
             import pickle
-            initializer(*pickle.loads(pickle.dumps(initargs)))
+            initializer(*(pickle.loads(pickle.dumps(initargs)) if self.PICKLE_INIT else initargs))
     def submit(self, fn, *args, **kwargs):
         import concurrent.futures as cf
         f = cf.Future()

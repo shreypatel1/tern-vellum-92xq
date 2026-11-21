@@ -20,6 +20,9 @@ class Index:
         self.inst = d.get("inst", {})
         self.exprclasses = set(d.get("exprclasses", ()))
         self.importtime = {k: set(v) for k, v in d.get("importtime", {}).items()}
+        self.subcov = d.get("subcov", {})
+        self.tpcfp = d.get("tpcfp", {})
+        self.state = d.get("state", {})
         self.imports = d["imports"]
 
     def name_set(self, n):
@@ -74,6 +77,9 @@ class Change:
         self.notes = []
         self.equivalent = set()
         self.equiv_needs = {}
+        self.spans = {}
+        self.itime = set()
+        self.it_fallback = 0
         for fp in self.files:
             self._one(fp)
 
@@ -96,6 +102,10 @@ class Change:
         new_text, removed, inserts = patchinfo.apply(old_text, fp)
         self.new_sources[path] = new_text
         opened = ix.opened_set(path)
+        if path.endswith(".py") and patchinfo.classify_fast(old_text, new_text, removed, inserts)["same"]:
+            # comment/blank-only edit of a module: reading it (imports, linecache) changes nothing
+            self.notes.append(f"comment-only {path}")
+            return
         self.cand |= opened
         self.precise |= opened
         if not path.endswith(".py"):
@@ -126,13 +136,19 @@ class Change:
         if spans & it:
             # the changed code runs while modules are imported (metaclass, class-body helper):
             # its effect is baked into classes, so treat it like a structural change
+            # (decided later by diffing module state after a patched import; see apply_itime)
             self.reimport.add(path)
+            self.itime.add(path)
             self.notes.append(f"import-time {path}")
-            reach = self._structural_reach(path, dict(info, attrs=None, scopes=[]))
-            self.cand |= reach
-            self.precise |= reach
+            self.it_fallback |= self._structural_reach(path, dict(info, attrs=None, scopes=[]))
+            for q, k, firstline in info["changed_funcs"]:
+                self.cand |= ix.line_set(path, -firstline)
+            for ln in spans:
+                self.precise |= ix.line_set(path, ln)
+                self.cand |= ix.line_set(path, ln)
             return
         self.swap[path] = info
+        self.spans[path] = spans
         eq = patchinfo.equivalent_units(info) if info.get("units") else patchinfo.equivalent_py(old_text, new_text)
         if eq:
             self.equivalent.add(path)
@@ -188,3 +204,74 @@ class Change:
             if b.bit_count() <= limit:
                 reach |= b
         return reach
+
+    def fp_eligible(self, tid):
+        """Can the outcome of this TPC executor test be decided by fingerprints?"""
+        sub = self.ix.subcov.get(tid)
+        if not sub or not self.ix.tpcfp:
+            return False
+        pos = self.ix.ids.index(tid)
+        for fp in self.files:
+            path = fp.path
+            if not path.endswith(".py"):
+                if (self.ix.opened_set(path) >> pos) & 1:
+                    return False
+                continue
+            B = sub["blines"].get(path)
+            if path in self.reimport:
+                if B:
+                    return False
+            elif path in self.swap:
+                sp = self.spans.get(path, set())
+                if B and (sp & set(B)):
+                    return False
+                # changed lines the test ran outside any per-query run (class setup etc.)
+                q = sub["lines"].get(path, {})
+                if any(((self.ix.line_set(path, ln) >> pos) & 1) and ln not in q for ln in sp):
+                    return False
+        return True
+
+    def apply_itime(self, keys):
+        """Reach of an import-time change given the module-state keys that differ (None = unknown)."""
+        ix = self.ix
+        n = len(ix.ids)
+        if keys is None:
+            # the patched import failed or could not be checked: anything may break
+            self.notes.append("itime-unknown -> all tests")
+            reach = (1 << n) - 1
+        elif len(keys) > 60:
+            self.notes.append(f"itime-fallback {len(keys)}")
+            reach = self.it_fallback
+        else:
+            self.notes.append(f"itime-diff {sorted(keys)[:6]}")
+            reach = 0
+            for k in keys:
+                mn, rest = k.split(":", 1)
+                if mn == "tests" or mn.startswith("tests."):
+                    pre = mn.replace(".", "/") + ".py::"
+                    b = 0
+                    for i, tid in enumerate(ix.ids):
+                        if tid.startswith(pre):
+                            b |= 1 << i
+                else:
+                    b = ix.name_set(rest.rsplit(".", 1)[-1])
+                    if b.bit_count() > n // 4:
+                        reach = self.it_fallback
+                        self.notes.append(f"itime-broad {k}")
+                        break
+                reach |= b
+        self.cand |= reach
+        self.precise |= reach
+
+    def fp_queries(self, tid):
+        """Indices of the TPC queries whose run touched a changed statement (None = all)."""
+        sub = self.ix.subcov[tid]
+        if self.reimport:
+            return None
+        m = 0
+        for path, sp in self.spans.items():
+            q = sub["lines"].get(path)
+            if q:
+                for ln in sp:
+                    m |= q.get(ln, 0)
+        return {i for i in range(sub["n"]) if (m >> i) & 1}

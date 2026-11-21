@@ -5,6 +5,7 @@ in-process against the patched code (forked child, function code swapped in plac
 schedule the failing ones plus any expensive reachable ones we chose not to run.
 """
 import builtins
+import importlib.util
 import gc
 import io
 import json
@@ -34,6 +35,7 @@ NEVER_RUN = {
 BLIND_CPU = float(os.environ.get("BR_BLIND_CPU", "2.5"))  # run-cost above which we include instead of running
 WORKER_COST = 2000
 LAST_CPU = 0.0
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.0"))
 HEAVY_IMPORT_MODULES = {"tests/test_executor.py", "tests/test_optimizer.py"}
 
 
@@ -165,7 +167,145 @@ def install_redirects(data_files):
     io.open = patched_open
 
 
-def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None):
+FP_TESTS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("tpcds", "exec"),
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": ("tpch", "exec"),
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tpch", "opt"),
+}
+
+
+FP_ATTR = {"tpcds": "tpcds_sqls", "tpch": "tpch_sqls"}
+FP_RUN_BUDGET = float(os.environ.get("BR_FP_BUDGET", "3.0"))
+
+
+def _run_subset(tid, attr, idxs, timeout):
+    """Run one TPC test restricted to the given query indices (patched code is live)."""
+    import harness
+    harness.import_all([tid])
+    harness.install_inline_pools()
+    cls, _ = harness.get_class(tid)
+    orig_setup = cls.__dict__["setUpClass"]
+
+    def setup(c):
+        orig_setup.__func__(c)
+        full = getattr(c, attr)
+        setattr(c, attr, [full[i] for i in sorted(idxs)])
+    cls.setUpClass = classmethod(setup)
+    try:
+        return bool(harness.run_tests([tid], timeout_for=lambda t: timeout))
+    finally:
+        cls.setUpClass = orig_setup
+
+
+def fp_failures(fp_ids, ch, ix):
+    """Fingerprint the queries a change reaches; run the real test on the ones that moved."""
+    import tpcfp
+    bad = set()
+    cache = {}
+    for tid in fp_ids:
+        which, mode = FP_TESTS[tid]
+        q = ch.fp_queries(tid)
+        ref = ix.tpcfp.get(which, {})
+        idxs = {int(i) for i in ref} if q is None else q
+        if not idxs:
+            continue
+        need = frozenset(idxs)
+        if which not in cache or not need <= cache[which][0]:
+            done = cache[which][0] if which in cache else frozenset()
+            now = dict(cache[which][1]) if which in cache else {}
+            now.update(tpcfp.fingerprints(which, need - done))
+            cache[which] = (done | need, now)
+        now = cache[which][1]
+        moved = set()
+        for i in idxs:
+            r = ref.get(str(i)) or ref.get(i)
+            n = now.get(i)
+            if r is None or n is None:
+                moved.add(i); continue
+            if mode == "exec":
+                if n[0] != r[0] or n[1] != r[1]:
+                    moved.add(i)
+            elif n[1] != r[1] or n[2] != r[2]:
+                moved.add(i)
+        print(f"fp {tid.rsplit('::',1)[1]} reached={len(idxs)} moved={sorted(moved)[:12]}", file=sys.stderr)
+        if not moved:
+            continue
+        pos = ix.ids.index(tid)
+        sub = ix.subcov.get(tid, {})
+        per_q = CPU_SCALE * ix.cpu[pos] / max(1, sub.get("n", 1))
+        if 1.5 + per_q * len(moved) > FP_RUN_BUDGET:
+            bad.add(tid); continue
+        try:
+            if _run_subset(tid, FP_ATTR[which], moved, max(5.0, 10 * per_q * len(moved))):
+                bad.add(tid)
+        except BaseException:
+            bad.add(tid)
+    return bad
+
+
+def state_diff(ch):
+    """Import everything with the patched sources in a child; return the module-state keys
+    that differ from the pinned commit's (None if unknown)."""
+    base = getattr(ch.ix, "state", None)
+    if not base or not base.get("snap"):
+        return None
+    r, w = os.pipe()
+    sys.stdout.flush(); sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.dup2(2, 1)
+            import signal
+            signal.alarm(30)
+            srcs = {}
+            for p, t in ch.new_sources.items():
+                if p.endswith(".py"):
+                    srcs[modname(p)] = (os.path.join(REPO, p), t)
+            for m in list(sys.modules):
+                if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."):
+                    del sys.modules[m]
+            sys.meta_path.insert(0, PatchedFinder(srcs))
+            os.environ["SKIP_INTEGRATION"] = "0"
+            os.chdir(REPO)
+            import state
+            bad = state.import_everything(REPO)
+            snap = state.snapshot()
+            b = json.dumps({"bad": bad, "snap": snap}).encode()
+            while b:
+                n = os.write(w, b); b = b[n:]
+        except BaseException:  # noqa
+            import traceback
+            traceback.print_exc()
+            sys.stderr.flush()
+        finally:
+            os._exit(0)
+    os.close(w)
+    chunks = []
+    while True:
+        b = os.read(r, 1 << 20)
+        if not b:
+            break
+        chunks.append(b)
+    os.close(r)
+    _, _, ru = os.wait4(pid, 0)
+    global ITIME_CPU
+    ITIME_CPU += ru.ru_utime + ru.ru_stime
+    try:
+        d = json.loads(b"".join(chunks))
+    except Exception:
+        return None
+    if sorted(d["bad"]) != sorted(base["bad"]):
+        return None
+    noisy = set(base["noisy"])
+    old, new = base["snap"], d["snap"]
+    return sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+
+
+ITIME_CPU = 0.0
+
+
+def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None):
     import harness
     ok = True
     try:
@@ -195,7 +335,10 @@ def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None):
             os.write(wfd, b"SWAPFAIL")
             return
         tmo = timeouts or {}
-        failed = harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
+        failed = set()
+        if fp_ids:
+            failed |= fp_failures(fp_ids, ch, ix)
+        failed |= harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
         os.write(wfd, json.dumps(sorted(failed)).encode())
     except BaseException as e:  # noqa
         import traceback
@@ -203,7 +346,7 @@ def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None):
         os.write(wfd, b"CRASH")
 
 
-def run_in_fork(ch, run_ids, funcs_by_file, timeouts=None):
+def run_in_fork(ch, run_ids, funcs_by_file, timeouts=None, fp_ids=(), ix=None):
     r, w = os.pipe()
     sys.stdout.flush(); sys.stderr.flush()
     pid = os.fork()
@@ -212,7 +355,7 @@ def run_in_fork(ch, run_ids, funcs_by_file, timeouts=None):
         try:
             # stdout belongs to the parent's answers only
             os.dup2(2, 1)
-            run_child(ch, run_ids, funcs_by_file, w, timeouts)
+            run_child(ch, run_ids, funcs_by_file, w, timeouts, fp_ids, ix)
         finally:
             os._exit(0)
     os.close(w)
@@ -239,7 +382,8 @@ def class_costs(ix):
     for i, tid in enumerate(ix.ids):
         c = tid.rsplit("::", 1)[0]
         setup[c] = min(setup.get(c, 1e9), ix.cpu[i])
-    per = [max(0.0, ix.cpu[i] - setup[tid.rsplit("::", 1)[0]] * 0.9) for i, tid in enumerate(ix.ids)]
+    per = [CPU_SCALE * max(0.0, ix.cpu[i] - setup[tid.rsplit("::", 1)[0]] * 0.9) for i, tid in enumerate(ix.ids)]
+    setup = {c: CPU_SCALE * v for c, v in setup.items()}
     return setup, per
 
 
@@ -284,11 +428,16 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
     if ch is None or ch.unknown:
         return None, None, "unknown", []
     S = [p for p in analyze.bits(ch.precise) if pos2num[p] is not None]
+    has_data = any(not fp.path.endswith(".py") for fp in ch.files)
+    only_equiv = (not has_data and not ch.reimport and ch.swap and set(ch.swap) <= ch.equivalent
+                  and all(enum_constants(p, ch.equiv_needs.get(p, ())) for p in ch.swap))
+    fpc = [] if only_equiv else [p for p in S if ix.ids[p] in FP_TESTS and ch.fp_eligible(ix.ids[p])]
+    ch.fpcheck = fpc
+    S = [p for p in S if p not in set(fpc)]
     if not S:
-        return [], [], "empty", []
+        return [], [], "empty" if not fpc else "fp-only", []
     forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail]
     runnable = [p for p in S if p not in set(forced)]
-    has_data = any(not fp.path.endswith(".py") for fp in ch.files)
     py_changed = bool(ch.swap or ch.reimport)
     if has_data and not fixture_comment_only(ch):
         q = 0.95
@@ -299,8 +448,6 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
     def d(ps):
         return {pos2num[p]: ms[pos2num[p]] for p in ps}
 
-    only_equiv = (not has_data and not ch.reimport and ch.swap and set(ch.swap) <= ch.equivalent
-                  and all(enum_constants(p, ch.equiv_needs.get(p, ())) for p in ch.swap))
     if only_equiv:
         # behaviour-preserving rewrite: run a cheap sentinel sample, include the rest only if it fails
         order = sorted(runnable, key=lambda p: per[p])
@@ -360,21 +507,24 @@ def main():
         text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="replace").read()
         try:
             ch = analyze.Change(cid, text, REPO, ix)
+            if ch.itime and not ch.unknown:
+                ch.apply_itime(state_diff(ch))
         except Exception as e:  # noqa
             log("analysis failed", cid, e)
             ch = None
         run, blind, label, onfail = plan_commit(ch, ix, pos2num, ms, per, setup)
         jobs.append((cid, ch, run, blind, label, onfail))
 
-    log(f"analysis cpu {time.process_time() - T0:.2f}s")
+    log(f"analysis cpu {time.process_time() - T0:.2f}s (+import-time diffs {ITIME_CPU:.2f}s)")
     need_ids = set()
     swap_files = set()
     for cid, ch, run, blind, label, onfail in jobs:
         if run:
             need_ids.update(ix.ids[p] for p in run)
+        if run or (ch is not None and getattr(ch, "fpcheck", None)):
             swap_files.update(ch.swap)
     funcs_by_file = {}
-    if need_ids:
+    if need_ids or swap_files:
         import harness
         import importlib
         import sqlglot  # noqa
@@ -409,17 +559,19 @@ def main():
             failed_pos = set()
             status = "none"
             cpu = 0.0
-            if run:
+            fpc = getattr(ch, "fpcheck", []) if ch is not None else []
+            if run or fpc:
                 rid = [ix.ids[p] for p in run]
                 tmo = {ix.ids[p]: max(2.0, 10 * ix.cpu[p]) for p in run}
-                res, status = run_in_fork(ch, rid, funcs_by_file, tmo)
+                res, status = run_in_fork(ch, rid, funcs_by_file, tmo, [ix.ids[p] for p in fpc], ix)
                 cpu = LAST_CPU
-                failed_pos = set(run) if res is None else {p for p in run if ix.ids[p] in res}
+                allp = list(run) + list(fpc)
+                failed_pos = set(allp) if res is None else {p for p in allp if ix.ids[p] in res}
             sel_pos = failed_pos | set(blind)
             if failed_pos and onfail:
                 sel_pos |= set(onfail)
             sel = {pos2num[p]: ms[pos2num[p]] for p in sel_pos}
-            log(cid, f"{label} run={len(run)} blind={len(blind)} failed={len(failed_pos)} status={status} cpu={cpu:.2f} notes={ch.notes}")
+            log(cid, f"{label} fp={len(fpc)} run={len(run)} blind={len(blind)} failed={len(failed_pos)} status={status} cpu={cpu:.2f} notes={ch.notes}")
         print(json.dumps({"commit": cid, "workers": pack(sel)}), flush=True)
     log(f"total cpu (parent) {time.process_time() - T0:.2f}s")
 
