@@ -300,10 +300,12 @@ def state_diff(ch, want_snapshot=True):
     if not base or not base.get("snap"):
         return None
     mods = None
-    if not ch.itime and not ch.full_diff:
-        # only module/class-level assignments changed: just the changed modules and the modules
-        # that (transitively) import them can hold different state
-        todo = [p for p in ch.diffpaths]
+    keep = False
+    if not want_snapshot or (not ch.itime and not ch.full_diff):
+        # only module/class-level assignments changed (or only the import is checked): just the
+        # changed modules and the modules that (transitively) import them can hold different
+        # state; the rest stay as the parent imported them
+        todo = [p for p in (ch.diffpaths if want_snapshot else ch.reimport)]
         seen = set(todo)
         while todo:
             p = todo.pop()
@@ -311,6 +313,15 @@ def state_diff(ch, want_snapshot=True):
                 if imp not in seen:
                     seen.add(imp); todo.append(imp)
         mods = {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
+        if all(_dialect_family(m) for m in mods):
+            # one dialect's own modules: keep everything else as the parent imported it
+            keep = True
+        else:
+            # core modules: everything is re-imported, so no module keeps the old classes
+            keep = False
+    # the parent imports everything once (third-party modules such as duckdb and pandas stay
+    # loaded): each patched import below then redoes only sqlglot and the tests
+    preimport_all()
     r, w = os.pipe()
     sys.stdout.flush(); sys.stderr.flush()
     pid = os.fork()
@@ -325,7 +336,8 @@ def state_diff(ch, want_snapshot=True):
                 if p.endswith(".py"):
                     srcs[modname(p)] = (os.path.join(REPO, p), t)
             for m in list(sys.modules):
-                if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."):
+                if m == "tests" or m.startswith("tests.") or (
+                        (m == "sqlglot" or m.startswith("sqlglot.")) and (not keep or m in mods)):
                     del sys.modules[m]
             sys.meta_path.insert(0, PatchedFinder(srcs))
             os.environ["SKIP_INTEGRATION"] = "0"
@@ -366,6 +378,7 @@ def state_diff(ch, want_snapshot=True):
     except Exception:
         return None
     if sorted(d["bad"]) != sorted(base["bad"]):
+        ch.newly_bad = set(d["bad"]) - set(base["bad"])
         return None
     if not want_snapshot:
         return []
@@ -388,6 +401,31 @@ def state_diff(ch, want_snapshot=True):
 
 
 ITIME_CPU = 0.0
+_PREIMPORTED = []
+
+
+def _dialect_family(m):
+    parts = m.split(".")
+    return (len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "generators", "parsers", "typing")
+            and parts[2] not in ("dialect", "base"))
+
+
+def preimport_all():
+    """Import every sqlglot and test module once in the parent (pytest order), so a patched
+    import in a child only redoes the modules a change can reach."""
+    if _PREIMPORTED:
+        return
+    _PREIMPORTED.append(1)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    cwd = os.getcwd()
+    os.chdir(REPO)
+    try:
+        import state
+        state.import_everything(REPO)
+    except Exception:  # noqa
+        pass
+    finally:
+        os.chdir(cwd)
 
 
 # Tests whose cost is input size, checked on a scaled-down copy (same code paths, same ratio of
@@ -668,9 +706,10 @@ def main():
             if (ch.itime or ch.diffpaths) and not ch.unknown:
                 ch.apply_itime(state_diff(ch))
             elif ch.reimport and not ch.unknown and state_diff(ch, want_snapshot=False) is None:
-                ch.unknown = True
-                ch.import_broken = True
-                ch.notes.append("patched import fails -> all tests")
+                if not ch.import_fail_reach():
+                    ch.unknown = True
+                    ch.import_broken = True
+                    ch.notes.append("patched import fails -> all tests")
         except Exception as e:  # noqa
             log("analysis failed", cid, e)
             ch = None

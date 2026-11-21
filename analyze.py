@@ -118,6 +118,7 @@ class Change:
         self.full_diff = False
         self.syntax_error = False
         self.import_broken = False
+        self.newly_bad = None
         self.odd = False
         for fp in self.files:
             self._one(fp)
@@ -374,6 +375,8 @@ class Change:
         if keys is not None:
             keys = [k for k in keys if k not in self.it_keys]
         n = len(ix.ids)
+        if keys is None and self.import_fail_reach(self.it_fallback | self.diff_fallback):
+            return
         if keys is None:
             # the patched import failed or could not be checked: anything may break
             self.notes.append("itime-unknown -> all tests")
@@ -414,6 +417,37 @@ class Change:
                 reach = fb
         self.cand |= reach
         self.precise |= reach
+
+    def import_fail_reach(self, extra=0):
+        """The patched import failed. If only one dialect's own modules (and test modules) fail to
+        import, the tests that can see it are the structural reach (which covers that dialect's
+        users) plus every test in a test module that no longer imports. Returns True if applied."""
+        nb = self.newly_bad
+        if not nb:
+            return False
+        ix = self.ix
+        test_mods = set()
+        for m in nb:
+            parts = m.split(".")
+            if parts[0] == "tests":
+                test_mods.add(m.replace(".", "/") + ".py::")
+            elif not (len(parts) == 3 and parts[0] == "sqlglot"
+                      and parts[1] in ("dialects", "generators", "parsers", "typing")
+                      and parts[2] not in ("dialect", "base")):
+                return False
+        b = extra
+        for m in nb:
+            if m.startswith("sqlglot."):
+                # whoever used that dialect (or ran its code) loads the broken module
+                path = m.replace(".", "/") + ".py"
+                b |= self._dialect_users(path) | ix.file_any(path)
+        for i, tid in enumerate(ix.ids):
+            if tid.startswith(tuple(test_mods)) if test_mods else False:
+                b |= 1 << i
+        self.cand |= b
+        self.precise |= b
+        self.notes.append(f"import fails only in {sorted(nb)[:4]}")
+        return True
 
     def fp_phase_b(self, tid):
         """True if a changed statement runs while queries are planned/executed in Python."""
