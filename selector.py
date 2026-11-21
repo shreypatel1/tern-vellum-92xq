@@ -450,7 +450,23 @@ def state_diff(ch):
                 importlib.import_module(m)  # an import error -> no output -> unknown
             state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
             snap = state.snapshot(mods=mods)
-        return {"bad": bad, "snap": snap}
+        # entries of the dicts whose value moved, to name the keys that changed
+        dicts = {}
+        try:
+            import keyuse
+            oldsnap = base["snap"] if mods is None else base["snapl"]
+            noisy_ = set(base["noisy"])
+            for k, v in snap.items():
+                if k in noisy_ or k not in oldsnap or oldsnap[k] == v:
+                    continue
+                o = keyuse.resolve(k)
+                if type(o) is dict:
+                    e = keyuse.entries(o)
+                    if e is not None:
+                        dicts[k] = e
+        except Exception:  # noqa
+            dicts = {}
+        return {"bad": bad, "snap": snap, "dicts": dicts}
     d = _in_child(child)
     if d is None:
         return None
@@ -463,6 +479,7 @@ def state_diff(ch):
         # and submodules nobody imported here are absent, not changed
         old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods and k in new}
     keys = sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+    ch.dict_entries = d.get("dicts") or {}
     if ch.full_diff and not ch.itime:
         # a module global that only the patched import binds (e.g. names imported under a
         # flipped TYPE_CHECKING guard): the pinned code ran without it, so no code the tests ran
