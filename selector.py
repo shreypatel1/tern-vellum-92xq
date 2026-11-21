@@ -298,7 +298,7 @@ def state_diff(ch):
     if not base or not base.get("snap"):
         return None
     mods = None
-    if not ch.itime:
+    if not ch.itime and not ch.full_diff:
         # only module/class-level assignments changed: just the changed modules and the modules
         # that (transitively) import them can hold different state
         todo = [p for p in ch.diffpaths]
@@ -371,7 +371,16 @@ def state_diff(ch):
         # only what this partial import produced: lazily created package attributes (PEP 562)
         # and submodules nobody imported here are absent, not changed
         old = {k: v for k, v in old.items() if k.split(":", 1)[0] in mods and k in new}
-    return sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+    keys = sorted(k for k in set(old) | set(new) if k not in noisy and old.get(k) != new.get(k))
+    if ch.full_diff and not ch.itime:
+        # a module global that only the patched import binds (e.g. names imported under a
+        # flipped TYPE_CHECKING guard): the pinned code ran without it, so no code the tests ran
+        # looked it up. Class attributes still count (they shadow inherited ones).
+        added = [k for k in keys if k not in old and "." not in k.split(":", 1)[1]]
+        if added:
+            ch.notes.append(f"new globals ignored {added[:4]}")
+            keys = [k for k in keys if k not in set(added)]
+    return keys
 
 
 ITIME_CPU = 0.0

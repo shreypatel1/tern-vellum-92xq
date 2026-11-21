@@ -56,6 +56,26 @@ class Index:
         return self.sets[s] if s is not None else 0
 
 
+def _plain_statements(info):
+    """True if every differing unit is a plain statement on both sides: no def, class or lambda
+    inside (their code is not part of the module-state snapshot)."""
+    import ast
+    u = info.get("units")
+    if not u:
+        return False
+    ou, nu, diff = u
+    if not diff:
+        return False
+    for i in diff:
+        for kind, node in (ou[i][1], nu[i][1]):
+            if kind != "stmt":
+                return False
+            for n in ast.walk(node):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    return False
+    return True
+
+
 def bits(b):
     out = []
     i = 0
@@ -95,6 +115,7 @@ class Change:
         self.diffpaths = set()
         self.it_keys = set()
         self.diff_fallback = 0
+        self.full_diff = False
         for fp in self.files:
             self._one(fp)
 
@@ -153,6 +174,15 @@ class Change:
                 self.diffpaths.add(path)
                 self.diff_fallback |= reach
                 self.notes.append("state-diff pending")
+                return
+            if not info["error"] and not info.get("attrs") and DIFF_STRUCTURAL and _plain_statements(info):
+                # module/class-level statements without any code in them (an `if` guarding
+                # imports, an import, a call made at import time): their effect is the state
+                # every module holds after a full patched import, so diff that
+                self.diffpaths.add(path)
+                self.full_diff = True
+                self.diff_fallback |= reach
+                self.notes.append("state-diff pending (plain statements)")
                 return
             self.cand |= reach
             # statement-level reach for blind decisions: also whole-file (conservative)
