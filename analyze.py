@@ -76,6 +76,12 @@ def _plain_statements(info):
     return True
 
 
+def _dialect_family_path(path):
+    parts = path[:-3].split("/")
+    return (len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "generators", "parsers", "typing")
+            and parts[2] not in ("dialect", "base", "__init__"))
+
+
 def bits(b):
     out = []
     i = 0
@@ -375,8 +381,6 @@ class Change:
         if keys is not None:
             keys = [k for k in keys if k not in self.it_keys]
         n = len(ix.ids)
-        if keys is None and self.import_fail_reach(self.it_fallback | self.diff_fallback):
-            return
         if keys is None:
             # the patched import failed or could not be checked: anything may break
             self.notes.append("itime-unknown -> all tests")
@@ -426,6 +430,9 @@ class Change:
         if not nb:
             return False
         ix = self.ix
+        if not all(fp.path.endswith(".py") and _dialect_family_path(fp.path) for fp in self.files):
+            # a core module changed: whatever broke one dialect's import may break other code too
+            return False
         test_mods = set()
         for m in nb:
             parts = m.split(".")

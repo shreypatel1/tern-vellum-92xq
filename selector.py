@@ -291,37 +291,20 @@ def fp_failures(fp_ids, ch, ix):
     return bad
 
 
-def state_diff(ch, want_snapshot=True):
-    """Import everything with the patched sources in a child; return the module-state keys
-    that differ from the pinned commit's (None if unknown, or if any sqlglot/test module that
-    imported at the pinned commit fails to import now). want_snapshot=False: only the import
-    check ([] when it passes)."""
-    base = getattr(ch.ix, "state", None)
-    if not base or not base.get("snap"):
-        return None
-    mods = None
-    keep = False
-    if not want_snapshot or (not ch.itime and not ch.full_diff):
-        # only module/class-level assignments changed (or only the import is checked): just the
-        # changed modules and the modules that (transitively) import them can hold different
-        # state; the rest stay as the parent imported them
-        todo = [p for p in (ch.diffpaths if want_snapshot else ch.reimport)]
-        seen = set(todo)
-        while todo:
-            p = todo.pop()
-            for imp in ch.ix.imports.get(p, []):
-                if imp not in seen:
-                    seen.add(imp); todo.append(imp)
-        mods = {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
-        if all(_dialect_family(m) for m in mods):
-            # one dialect's own modules: keep everything else as the parent imported it
-            keep = True
-        else:
-            # core modules: everything is re-imported, so no module keeps the old classes
-            keep = False
-    # the parent imports everything once (third-party modules such as duckdb and pandas stay
-    # loaded): each patched import below then redoes only sqlglot and the tests
-    preimport_all()
+def _closure(ch, paths):
+    """sqlglot module names of paths and of every module that (transitively) imports them."""
+    todo = list(paths)
+    seen = set(todo)
+    while todo:
+        p = todo.pop()
+        for imp in ch.ix.imports.get(p, []):
+            if imp not in seen:
+                seen.add(imp); todo.append(imp)
+    return {modname(p) for p in seen if p.startswith("sqlglot/") and not p.endswith("__main__.py")}
+
+
+def _in_child(fn):
+    """Run fn() in a forked child; return its JSON result (None if it crashed)."""
     r, w = os.pipe()
     sys.stdout.flush(); sys.stderr.flush()
     pid = os.fork()
@@ -331,29 +314,7 @@ def state_diff(ch, want_snapshot=True):
             os.dup2(2, 1)
             import signal
             signal.alarm(30)
-            srcs = {}
-            for p, t in ch.new_sources.items():
-                if p.endswith(".py"):
-                    srcs[modname(p)] = (os.path.join(REPO, p), t)
-            for m in list(sys.modules):
-                if m == "tests" or m.startswith("tests.") or (
-                        (m == "sqlglot" or m.startswith("sqlglot.")) and (not keep or m in mods)):
-                    del sys.modules[m]
-            sys.meta_path.insert(0, PatchedFinder(srcs))
-            os.environ["SKIP_INTEGRATION"] = "0"
-            os.chdir(REPO)
-            import state
-            # always the full import (tests too): a class body that builds expressions at import
-            # time (templates parsed in a generator) can break a test module's import
-            bad = state.import_everything(REPO)
-            if not want_snapshot:
-                snap = {}
-            elif mods is None:
-                snap = state.snapshot()
-            else:
-                state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
-                snap = state.snapshot(mods=mods)
-            b = json.dumps({"bad": bad, "snap": snap}).encode()
+            b = json.dumps(fn()).encode()
             while b:
                 n = os.write(w, b); b = b[n:]
         except BaseException:  # noqa
@@ -374,14 +335,127 @@ def state_diff(ch, want_snapshot=True):
     global ITIME_CPU
     ITIME_CPU += ru.ru_utime + ru.ru_stime
     try:
-        d = json.loads(b"".join(chunks))
+        return json.loads(b"".join(chunks))
     except Exception:
         return None
-    if sorted(d["bad"]) != sorted(base["bad"]):
-        ch.newly_bad = set(d["bad"]) - set(base["bad"])
+
+
+def _patched_finder(ch, drop):
+    srcs = {}
+    for p, t in ch.new_sources.items():
+        if p.endswith(".py"):
+            srcs[modname(p)] = (os.path.join(REPO, p), t)
+    for m in list(sys.modules):
+        if drop(m):
+            del sys.modules[m]
+    sys.meta_path.insert(0, PatchedFinder(srcs))
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.chdir(REPO)
+
+
+def import_check(ch):
+    """Import every test module (in pytest's collection order) and then every sqlglot module
+    with the patched sources, in a child. True if the same modules import as at the pinned
+    commit; otherwise False, with ch.newly_bad naming the ones that no longer do (None if the
+    child crashed). Order matters: a class body that builds expressions at import time
+    (templates parsed in a generator) can break the import of the first test module to load it."""
+    base = getattr(ch.ix, "state", None)
+    if not base or "bad" not in base:
+        return False
+    mods = _closure(ch, ch.reimport)
+    # one dialect's own modules: everything else stays as the parent imported it
+    keep = all(_dialect_family(m) for m in mods)
+    preimport_all()
+
+    def child():
+        _patched_finder(ch, lambda m: m == "tests" or m.startswith("tests.") or (
+            (m == "sqlglot" or m.startswith("sqlglot.")) and (not keep or m in mods)))
+        return import_pytest_order(REPO)
+    bad = _in_child(child)
+    if bad is None:
+        return False
+    if sorted(bad) != sorted(base["bad"]):
+        ch.newly_bad = set(bad) - set(base["bad"])
+        return False
+    return True
+
+
+def import_pytest_order(repo):
+    import importlib
+    import pkgutil
+    bad = []
+    tests = []
+
+    def walk(d):
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if os.path.isdir(p):
+                if name not in ("__pycache__", "fixtures"):
+                    walk(p)
+            elif name.startswith("test_") and name.endswith(".py"):
+                tests.append(os.path.relpath(p, repo)[:-3].replace(os.sep, "."))
+    walk(os.path.join(repo, "tests"))
+    for m in tests:
+        try:
+            importlib.import_module(m)
+        except BaseException:
+            bad.append(m)
+    import sqlglot
+    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if m.name.endswith("__main__") or m.name in sys.modules:
+            continue
+        try:
+            importlib.import_module(m.name)
+        except Exception:
+            bad.append(m.name)
+    # the rest of tests/ (helpers and modules pytest does not collect), as state.py does
+    for root, _, files in os.walk(os.path.join(repo, "tests")):
+        for f in sorted(files):
+            if f.endswith(".py"):
+                rel = os.path.relpath(os.path.join(root, f), repo)[:-3].replace(os.sep, ".")
+                if rel.endswith("__init__"):
+                    rel = rel[:-9]
+                if rel in sys.modules or rel in bad:
+                    continue
+                try:
+                    importlib.import_module(rel)
+                except BaseException:
+                    bad.append(rel)
+    return bad
+
+
+def state_diff(ch):
+    """Import everything with the patched sources in a child; return the module-state keys
+    that differ from the pinned commit's (None if unknown)."""
+    base = getattr(ch.ix, "state", None)
+    if not base or not base.get("snap"):
         return None
-    if not want_snapshot:
-        return []
+    mods = None
+    if not ch.itime and not ch.full_diff:
+        # only module/class-level assignments changed: just the changed modules and the modules
+        # that (transitively) import them can hold different state
+        mods = _closure(ch, ch.diffpaths)
+    preimport_all()
+
+    def child():
+        _patched_finder(ch, lambda m: m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests."))
+        import state
+        if mods is None:
+            bad = state.import_everything(REPO)
+            snap = state.snapshot()
+        else:
+            import importlib
+            bad = list(base["bad"])
+            for m in sorted(mods):
+                importlib.import_module(m)  # an import error -> no output -> unknown
+            state.LAMBDA_CODE = True  # assignment-only edits: a lambda's code is part of the value
+            snap = state.snapshot(mods=mods)
+        return {"bad": bad, "snap": snap}
+    d = _in_child(child)
+    if d is None:
+        return None
+    if sorted(d["bad"]) != sorted(base["bad"]):
+        return None
     noisy = set(base["noisy"])
     old, new = (base["snap"] if mods is None else base["snapl"]), d["snap"]
     if mods is not None:
@@ -703,13 +777,13 @@ def main():
                 # the changed code already runs in most tests: schedule everything, skip the checks
                 ch.unknown = True
                 ch.notes.append("broad import-time change -> all tests")
-            if (ch.itime or ch.diffpaths) and not ch.unknown:
-                ch.apply_itime(state_diff(ch))
-            elif ch.reimport and not ch.unknown and state_diff(ch, want_snapshot=False) is None:
-                if not ch.import_fail_reach():
+            if ch.reimport and not ch.unknown and not import_check(ch):
+                if not ch.import_fail_reach(ch.it_fallback | ch.diff_fallback):
                     ch.unknown = True
                     ch.import_broken = True
                     ch.notes.append("patched import fails -> all tests")
+            if (ch.itime or ch.diffpaths) and not ch.unknown:
+                ch.apply_itime(state_diff(ch))
         except Exception as e:  # noqa
             log("analysis failed", cid, e)
             ch = None
