@@ -134,6 +134,23 @@ class _Blank(ast.NodeTransformer):
         return node
 
 
+class _P(ast.AST):
+    _fields = ("x",)
+
+
+def _clone(n):
+    """Structural copy of an AST (what copy.deepcopy gives, without its bookkeeping)."""
+    if isinstance(n, ast.AST):
+        c = n.__class__.__new__(n.__class__)
+        d = c.__dict__
+        for k, v in n.__dict__.items():
+            d[k] = _clone(v) if isinstance(v, (ast.AST, list)) else v
+        return c
+    if isinstance(n, list):
+        return [_clone(x) if isinstance(x, (ast.AST, list)) else x for x in n]
+    return n
+
+
 def _functions(tree):
     """Return {key: node} for all function/lambda nodes, key = (qualname, ordinal)."""
     res = {}
@@ -176,8 +193,6 @@ def _functions(tree):
 
     def walk_wrap(node, qual):
         # treat node itself as a child of a dummy parent
-        class _P(ast.AST):
-            _fields = ("x",)
         p = _P(); p.x = node
         walk(p, qual)
 
@@ -188,7 +203,7 @@ def _functions(tree):
 def _own_body_dump(fn):
     """Dump of a function's body with nested function bodies blanked."""
     import copy
-    f = copy.deepcopy(fn)
+    f = _clone(fn)
     if isinstance(f, ast.Lambda):
         body = [f.body]
     else:
@@ -227,8 +242,8 @@ def classify_py(old_text, new_text):
     of = _functions(old_t)
     nf = _functions(new_t)
     import copy
-    ob = _dump(_Blank().visit(copy.deepcopy(old_t)))
-    nb = _dump(_Blank().visit(copy.deepcopy(new_t)))
+    ob = _dump(_Blank().visit(_clone(old_t)))
+    nb = _dump(_Blank().visit(_clone(new_t)))
     structural = ob != nb or set(of) != set(nf)
     names, attrs = set(), None
     if structural:
@@ -268,9 +283,9 @@ def _scopes(tree):
             if isinstance(st, ast.ClassDef):
                 visit(st.body, f"{q}.{st.name}" if q else st.name)
                 head = copy.copy(st); head.body = []
-                items.append((_dump(_Blank().visit(copy.deepcopy(head))), nm, False))
+                items.append((_dump(_Blank().visit(_clone(head))), nm, False))
             else:
-                items.append((_dump(_Blank().visit(copy.deepcopy(st))), nm, is_assign))
+                items.append((_dump(_Blank().visit(_clone(st))), nm, is_assign))
         out[q] = items
     visit(tree.body, "")
     return out
@@ -418,7 +433,7 @@ def _unit_dump(u, blank=False):
         h.decorator_list = list(node.decorator_list)
         return _dump(h)
     if blank:
-        return _dump(_Blank().visit(copy.deepcopy(node)))
+        return _dump(_Blank().visit(_clone(node)))
     return _dump(node)
 
 
@@ -439,7 +454,7 @@ def _assign_targets(node):
 def _no_defaults_dump(fn):
     """Dump of a def with its body blanked and argument default values removed."""
     import copy
-    f = copy.deepcopy(fn)
+    f = _clone(fn)
     f.args.defaults = []
     f.args.kw_defaults = []
     return _dump(_Blank().visit(f))
@@ -451,7 +466,7 @@ def _doc_stripped(unit):
     node = unit[1]
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
         return (unit[0], "DOC")  # a bare string statement: a class/module docstring or a no-op
-    node = copy.deepcopy(node)
+    node = _clone(node)
     for n in ast.walk(node):
         if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             b = n.body
@@ -556,8 +571,8 @@ def equivalent_units(info):
     need = set()
     for i in diff:
         na, nb = _NormEq(), _NormEq()
-        a = na.visit(copy.deepcopy(ou[i][1][1]))
-        b = nb.visit(copy.deepcopy(nu[i][1][1]))
+        a = na.visit(_clone(ou[i][1][1]))
+        b = nb.visit(_clone(nu[i][1][1]))
         if _dump(a) != _dump(b):
             return False
         need |= na.needs_eval | nb.needs_eval
