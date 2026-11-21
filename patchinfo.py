@@ -605,3 +605,87 @@ def stmt_spans_tree(tree, lines):
             s, e, _ = best
             out.update(range(s, e + 1)) if s <= ln <= e else out.add(ln)
     return out
+
+
+def _code_lines(text):
+    """Line numbers that own at least one bytecode instruction (any nested code object)."""
+    out = set()
+    todo = [compile(text, "<x>", "exec", dont_inherit=True)]
+    while todo:
+        co = todo.pop()
+        for _, _, ln in co.co_lines():
+            if ln is not None:
+                out.add(ln)
+        todo.extend(c for c in co.co_consts if hasattr(c, "co_lines"))
+    return out
+
+
+def exact_lines(old_text, new_text):
+    """Changed lines if the edit replaces whole lines in place (same line count) and every
+    changed line holds bytecode both before and after: then the new code on such a line runs
+    exactly when the old code on it ran (all code before it is unchanged), so per-line
+    coverage of the old line is the reach. None if that does not hold."""
+    a = old_text.split("\n")
+    b = new_text.split("\n")
+    if len(a) != len(b):
+        return None
+    d = {i + 1 for i, (x, y) in enumerate(zip(a, b)) if x != y}
+    if not d or len(d) > 3:
+        return None
+    try:
+        ol = _code_lines(old_text)
+        nl = _code_lines(new_text)
+    except Exception:
+        return None
+    if not d <= ol or not d <= nl:
+        return None
+    # every AST difference must sit in a node that lies wholly on one changed line (so code
+    # on other lines, e.g. short-circuit jumps of a reshaped and/or chain, is unchanged)
+    try:
+        diffs = []
+        _ast_diff(ast.parse(old_text), ast.parse(new_text), [], diffs)
+    except Exception:
+        return None
+    if not diffs:
+        return None
+    for na, nb in diffs:
+        for n in (na, nb):
+            ln = getattr(n, "lineno", None)
+            if ln is None or ln != getattr(n, "end_lineno", None) or ln not in d:
+                return None
+    return d
+
+
+def _located(chain):
+    """Nearest ancestor with a location that is not a bare constant (constants can be folded
+    into the enclosing operation, whose code may sit on another line)."""
+    for n in reversed(chain):
+        if hasattr(n, "lineno") and not isinstance(n, ast.Constant):
+            return n
+    return None
+
+
+def _ast_diff(a, b, chain, out):
+    if type(a) is not type(b):
+        if isinstance(a, ast.AST) or isinstance(b, ast.AST):
+            pa = _located(chain + ([a] if isinstance(a, ast.AST) else []))
+            pb = _located(chain + ([b] if isinstance(b, ast.AST) else []))
+            if isinstance(a, ast.AST) and isinstance(b, ast.AST) and hasattr(a, "lineno") and hasattr(b, "lineno") \
+                    and not isinstance(a, ast.Constant) and not isinstance(b, ast.Constant):
+                out.append((a, b))
+            else:
+                out.append((pa, pb))
+        else:
+            out.append((_located(chain), _located(chain)))
+        return
+    if isinstance(a, ast.AST):
+        for f in a._fields:
+            _ast_diff(getattr(a, f, None), getattr(b, f, None), chain + [a], out)
+    elif isinstance(a, list):
+        if len(a) != len(b):
+            out.append((_located(chain), _located(chain)))
+            return
+        for x, y in zip(a, b):
+            _ast_diff(x, y, chain, out)
+    elif a != b or type(a) is not type(b):
+        out.append((_located(chain), _located(chain)))

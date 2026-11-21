@@ -166,6 +166,10 @@ class Change:
             lines.add(p - 1)
             lines.add(p)
         spans = patchinfo.stmt_spans_tree(info["old_tree"], lines)
+        ex = patchinfo.exact_lines(old_text, new_text)
+        if ex is not None:
+            # in-place edit of lines that hold code: per-line coverage is exact
+            spans = ex
         it = ix.importtime.get(path, set())
         body_only = self._called_only_at_runtime(path, info)
         if body_only is not None:
@@ -209,6 +213,10 @@ class Change:
             lines.add(p - 1)
             lines.add(p)
         spans = patchinfo.stmt_spans_tree(info["old_tree"], lines)
+        ex = patchinfo.exact_lines(old_text, new_text)
+        if ex is not None:
+            # in-place edit of lines that hold code: per-line coverage is exact
+            spans = ex
         for ln in spans:
             self.precise |= ix.line_set(path, ln)
 
@@ -334,7 +342,7 @@ class Change:
             # the patched import failed or could not be checked: anything may break
             self.notes.append("itime-unknown -> all tests")
             reach = (1 << n) - 1
-        elif keys is None or len(keys) > 60:
+        elif keys is None or len(keys) > 400:
             self.notes.append(f"diff-fallback {None if keys is None else len(keys)}")
             reach = self.it_fallback | self.diff_fallback
         else:
@@ -352,13 +360,20 @@ class Change:
                     b = ix.name_set(rest.rsplit(".", 1)[-1])
                     # state of a dialect class (or a class nested in one): only its users see it
                     u = self.class_users(mn, rest.split(".", 1)[0]) if "." in rest else None
+                    if u is None and "." in rest:
+                        # a helper class in a dialect module (e.g. a tokenizer only that dialect
+                        # builds on): only users of dialects built from that file see it
+                        fn = mn.replace(".", "/") + ".py"
+                        if fn.startswith("sqlglot/dialects/") and fn not in (
+                                "sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py"):
+                            u = self._dialect_users(fn) or None
                     if u is not None:
                         b &= u
-                    if b.bit_count() > n // 4:
-                        reach = self.it_fallback | self.diff_fallback
-                        self.notes.append(f"itime-broad {k}")
-                        break
                 reach |= b
+            fb = self.it_fallback | self.diff_fallback
+            if reach.bit_count() > n // 4 and fb.bit_count() < reach.bit_count():
+                self.notes.append("itime-broad")
+                reach = fb
         self.cand |= reach
         self.precise |= reach
 
