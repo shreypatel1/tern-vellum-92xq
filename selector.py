@@ -679,6 +679,16 @@ def run_child(ch, run_ids, funcs_by_file, wfd, timeouts=None, fp_ids=(), ix=None
                 except Exception:  # noqa
                     failed.add(tid)
                     run_ids = [t for t in run_ids if t != tid]
+        cf = {t: f for t, f in (getattr(ch, "case_filters", None) or {}).items() if t in run_ids}
+        if cf:
+            import casecov
+            casecov.install()
+            for tid, filt in cf.items():
+                casecov.FILTER.clear()
+                casecov.FILTER.update(filt)
+                failed |= harness.run_tests([tid], timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
+            casecov.FILTER.clear()
+            run_ids = [t for t in run_ids if t not in cf]
         failed |= harness.run_tests(run_ids, timeout_for=lambda t: tmo.get(t, TEST_TIMEOUT))
         os.write(wfd, json.dumps(sorted(failed)).encode())
     except BaseException as e:  # noqa
@@ -764,6 +774,37 @@ def enum_constants(path, exprs):
         return False
 
 
+CASECOV = {}
+
+
+def case_filter(ch, tid):
+    """{fixture: case indices} that can reach the change, for a fixture-looping test whose
+    per-case coverage was recorded; None if every case must run (or the data is missing)."""
+    e = CASECOV.get(tid)
+    if not e or e["fail"] or not ch.swap or ch.reimport:
+        return None
+    if any(not fp.path.endswith(".py") or not fp.path.startswith("sqlglot/") for fp in ch.files):
+        return None
+    if set(ch.swap) != {fp.path for fp in ch.files}:
+        return None
+    keep = {f: 0 for f in e["fx"]}
+    for path in ch.swap:
+        spans = ch.spans.get(path)
+        if not spans:
+            return None
+        base = set(e["base"].get(path, ()))
+        m = e["m"].get(path, {})
+        for ln in spans:
+            if ln in base:
+                return None
+            for f, bits in m.get(ln, {}).items():
+                keep[f] = keep.get(f, 0) | bits
+    filt = {f: {k for k in range(n) if keep.get(f, 0) >> k & 1} for f, n in e["fx"].items()}
+    if sum(len(v) for v in filt.values()) >= sum(e["fx"].values()):
+        return None
+    return filt
+
+
 def plan_commit(ch, ix, pos2num, ms, per, setup):
     """Return (run_positions, blind_positions, label)."""
     if ch is None or ch.unknown:
@@ -783,6 +824,19 @@ def plan_commit(ch, ix, pos2num, ms, per, setup):
             if ix.ids[p] in SHRINK and shrink_ok(ch, ix.ids[p]):
                 per[p] = SHRINK[ix.ids[p]][2]
     forced = [p for p in S if ix.ids[p] in NEVER_RUN or ix.ids[p] in ix.basefail]
+    ch.case_filters = {}
+    if CASECOV:
+        for p in S:
+            tid = ix.ids[p]
+            if tid in CASECOV and p not in set(forced):
+                filt = case_filter(ch, tid)
+                if filt is not None:
+                    e = CASECOV[tid]
+                    frac = sum(len(v) for v in filt.values()) / max(1, sum(e["fx"].values()))
+                    if not ch.case_filters:
+                        per = list(per)
+                    per[p] = per[p] * frac + 0.02
+                    ch.case_filters[tid] = filt
     runnable = [p for p in S if p not in set(forced)]
     py_changed = bool(ch.swap or ch.reimport)
     if has_data and not fixture_comment_only(ch):
@@ -856,6 +910,11 @@ def main():
     # tracemalloc; it passes in our harness at the pinned commit, so it can be run like any test
     ix.basefail.discard("tests/test_generator.py::TestGenerator::test_generator_memory")
     setup, per = class_costs(ix)
+    try:
+        import casecov
+        CASECOV.update(casecov.load(os.path.join(HERE, "casecov.bin")))
+    except Exception:  # noqa
+        pass
     num_of = {t["id"]: t["number"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     pos2num = [num_of.get(i) for i in ix.ids]
