@@ -188,6 +188,14 @@ class Change:
                     self.precise |= b
                 return
             reach = self._structural_reach(path, info)
+            added_defs = self._added_defs_only(path, info)
+            if added_defs is not None:
+                # the only structural change is new top-level def/class definitions whose names
+                # are new to the module and referenced nowhere else in the patch. A brand-new
+                # name that no existing code looks up cannot change any test's behaviour, and a
+                # new top-level def/class does not run at import. Reach is empty.
+                self.notes.append(f"added-defs-only {sorted(added_defs)} -> 0")
+                return
             if (not info["error"] and info.get("attrs") and DIFF_STRUCTURAL
                     and not any(n.startswith("attr-reach") or n.startswith("expr-class") for n in self.notes)):
                 # only module/class-level assignments changed: their whole effect is the module
@@ -329,6 +337,84 @@ class Change:
             if path in files and k != "sqlglot.dialects.dialect:Dialect":
                 b |= ix.clsuse.get(k, 0)
         return b
+
+    def _added_defs_only(self, path, info):
+        """If the structural change to `path` only ADDS top-level def/class definitions whose
+        names are new and unreferenced elsewhere, return that set of names; else None.
+
+        Such additions cannot change any existing test: a new top-level def/class does not run
+        at import, and a name nothing looks up changes no behaviour. Conservative - any doubt
+        returns None (keep the normal structural reach)."""
+        import ast
+        new_text = self.new_sources.get(path)
+        old_tree = info.get("old_tree")
+        if new_text is None or old_tree is None or info.get("error"):
+            return None
+        try:
+            new_tree = ast.parse(new_text)
+        except SyntaxError:
+            return None
+
+        def top_named(tree):
+            out = {}
+            for st in tree.body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    out[st.name] = st
+            return out
+
+        old_named = top_named(old_tree)
+        new_named = top_named(new_tree)
+        added = set(new_named) - set(old_named)
+        if not added:
+            return None
+        # every old top-level statement must survive unchanged, and the only new top-level
+        # statements are the added defs/classes (no other structural edit rode along)
+        def sig(tree):
+            # dump each top-level statement, blanking def/class bodies, keyed in order
+            out = []
+            for st in tree.body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and st.name in added:
+                    continue  # the additions themselves
+                b = patchinfo._Blank()
+                import copy
+                out.append(patchinfo._dump(b.visit(patchinfo._clone(st))))
+            return out
+        if sig(old_tree) != sig(new_tree):
+            return None
+        # a new name must not collide with anything the old module already had (import, assign,
+        # or export) and must not be referenced anywhere in the new module outside its own body
+        old_all_names = set()
+        for st in old_tree.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name):
+                    old_all_names.add(n.id)
+                elif isinstance(n, ast.alias):
+                    old_all_names.add((n.asname or n.name).split(".")[0])
+        if added & old_all_names:
+            return None
+        # references to the added names anywhere in the new module (outside their own defs)
+        bodies = {new_named[a] for a in added}
+        referenced = set()
+        for st in new_tree.body:
+            if st in bodies:
+                continue
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and n.id in added:
+                    referenced.add(n.id)
+        # also: if the module defines __all__ and an added name is listed, it is an export change
+        for st in new_tree.body:
+            tgt = None
+            if isinstance(st, ast.Assign):
+                tgt = st.targets
+            elif isinstance(st, ast.AugAssign):
+                tgt = [st.target]
+            if tgt and any(isinstance(t, ast.Name) and t.id == "__all__" for t in tgt):
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Constant) and n.value in added:
+                        referenced.add(n.value)
+        if referenced:
+            return None
+        return added
 
     def _structural_reach(self, path, info):
         ix = self.ix
