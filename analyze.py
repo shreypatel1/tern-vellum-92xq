@@ -273,8 +273,33 @@ class Change:
         if ex is not None:
             # in-place edit of lines that hold code: per-line coverage is exact
             spans = ex
+        span_reach = 0
+        span_by_line = {}
         for ln in spans:
-            self.precise |= ix.line_set(path, ln)
+            b = ix.line_set(path, ln)
+            span_by_line[ln] = b
+            span_reach |= b
+        self.precise |= span_reach
+        if ex is None:
+            # Inserted lines carry no recorded per-line coverage (they did not exist at the
+            # pinned commit), so statement-span reach can be empty for a body that was only
+            # added to. Any changed function whose own changed span lines resolved to nothing
+            # then loses all reach. Fall back to that function's whole-reach (its callers) so an
+            # inserted body line never drops the test that exercises it. Over-selects the
+            # function's callers, which is the safe direction.
+            nodes = patchinfo._functions(info["old_tree"])
+            for q, k, firstline in info["changed_funcs"]:
+                node = nodes.get((q, k))
+                lo, hi = firstline, (node.end_lineno if node else firstline)
+                own = 0
+                for ln, b in span_by_line.items():
+                    if lo <= ln <= hi:
+                        own |= b
+                if own == 0:
+                    whole = ix.line_set(path, -firstline)
+                    if whole:
+                        self.precise |= whole
+                        self.notes.append(f"body-insert fallback {q} -> {whole.bit_count()}")
 
     def _called_only_at_runtime(self, path, info):
         """Line ranges of the changed functions if none of them is called while modules are
