@@ -956,7 +956,12 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     pos2num = [num_of.get(i) for i in ix.ids]
     cdir = os.path.join(DATA, "commits")
-    commits = sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch"))
+    # One line per real commit. Skip macOS AppleDouble sidecars ("._<id>.patch"): tar on macOS
+    # writes them next to each real patch, and treating them as commits emits phantom ids that
+    # are not in the answers (the scorer then rejects, or they inflate cost). A real commit id
+    # never begins with "._". Nothing else is filtered: every genuine *.patch must get a line.
+    commits = sorted(f[:-6] for f in os.listdir(cdir)
+                     if f.endswith(".patch") and not f.startswith("._"))
     jobs = []
     for cid in commits:
         text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="replace").read()
