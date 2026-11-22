@@ -1,0 +1,11 @@
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -4414,7 +4414,7 @@
+ 
+         alias = self._parse_table_alias(self.ID_VAR_TOKENS)
+         if not alias or not alias.this:
+-            self.raise_error("Expected CTE to have alias")
++            self.raise_error("CTE requires an alias")
+ 
+         key_expressions = (
+             self._parse_wrapped_id_vars() if self._match_text_seq("USING", "KEY") else None

@@ -1,0 +1,11 @@
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -5184,7 +5184,7 @@
+             table = None
+ 
+         if not table and not is_db_reference:
+-            self.raise_error(f"Expected table name but got {self._curr}")
++            self.raise_error(f"table name required, got {self._curr}")
+         if not db and is_db_reference:
+             self.raise_error(f"Expected database name but got {self._curr}")
+ 

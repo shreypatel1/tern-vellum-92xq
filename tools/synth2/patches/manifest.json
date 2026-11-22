@@ -1,0 +1,132 @@
+[
+  {
+    "name": "opt_always_false_breaks",
+    "cat": 1,
+    "behavior": "change"
+  },
+  {
+    "name": "opt_is_zero_wrong",
+    "cat": 1,
+    "behavior": "change"
+  },
+  {
+    "name": "opt_normalize_maxdist",
+    "cat": 1,
+    "behavior": "change"
+  },
+  {
+    "name": "exp_to_identifier_none",
+    "cat": 2,
+    "behavior": "change"
+  },
+  {
+    "name": "exp_column_drops_table",
+    "cat": 2,
+    "behavior": "change"
+  },
+  {
+    "name": "dialect_mysql_safe_div",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "dialect_mysql_concat_ws",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "dialect_base_dpipe",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "expr_eq_always_false",
+    "cat": 6,
+    "behavior": "change"
+  },
+  {
+    "name": "expr_ne_broken",
+    "cat": 6,
+    "behavior": "change"
+  },
+  {
+    "name": "err_parse_text",
+    "cat": 7,
+    "behavior": "change"
+  },
+  {
+    "name": "err_table_name",
+    "cat": 7,
+    "behavior": "change"
+  },
+  {
+    "name": "opt_rules_drop_simplify",
+    "cat": 1,
+    "behavior": "change"
+  },
+  {
+    "name": "opt_rules_reorder",
+    "cat": 1,
+    "behavior": "change"
+  },
+  {
+    "name": "exp_and_becomes_or",
+    "cat": 2,
+    "behavior": "change"
+  },
+  {
+    "name": "gen_null_ordering_off",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "gen_wrap_derived_off",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "gen_except_all_off",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "dialect_base_udt_off",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "dialect_base_tablesample_pct",
+    "cat": 3,
+    "behavior": "change"
+  },
+  {
+    "name": "multi_mysql_and_generator",
+    "cat": 4,
+    "behavior": "change"
+  },
+  {
+    "name": "multi_optimizer_and_simplify",
+    "cat": 4,
+    "behavior": "change"
+  },
+  {
+    "name": "helper_seq_get_off",
+    "cat": 5,
+    "behavior": "change"
+  },
+  {
+    "name": "expr_copy_noop",
+    "cat": 6,
+    "behavior": "change"
+  },
+  {
+    "name": "refactor_always_false",
+    "cat": 8,
+    "behavior": "noop"
+  },
+  {
+    "name": "refactor_seq_get",
+    "cat": 8,
+    "behavior": "noop"
+  }
+]

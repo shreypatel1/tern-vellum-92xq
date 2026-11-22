@@ -1,0 +1,11 @@
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -835,7 +835,7 @@
+     )
+ 
+     def __eq__(self, other: object) -> bool:
+-        return self is other or (type(self) is type(other) and hash(self) == hash(other))
++        return self is other
+ 
+     def __ne__(self, other: object) -> bool:
+         return not self.__eq__(other)

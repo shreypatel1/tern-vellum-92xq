@@ -1,0 +1,11 @@
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -298,7 +298,7 @@
+     # Whether null ordering is supported in order by
+     # True: Full Support, None: No support, False: No support for certain cases
+     # such as window specifications, aggregate functions etc
+-    NULL_ORDERING_SUPPORTED: bool | None = True
++    NULL_ORDERING_SUPPORTED: bool | None = False
+ 
+     # Window functions that support NULLS FIRST/LAST
+     WINDOW_FUNCS_WITH_NULL_ORDERING: t.ClassVar[tuple[type[exp.Expression], ...]] = ()

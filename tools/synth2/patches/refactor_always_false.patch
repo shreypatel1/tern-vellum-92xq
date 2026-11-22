@@ -1,0 +1,12 @@
+--- a/sqlglot/optimizer/simplify.py
++++ b/sqlglot/optimizer/simplify.py
+@@ -336,7 +336,8 @@
+ 
+ 
+ def always_false(expression: object) -> bool:
+-    return is_false(expression) or is_null(expression) or is_zero(expression)
++    result = is_false(expression) or is_null(expression) or is_zero(expression)
++    return result
+ 
+ 
+ def is_zero(expression: object) -> bool:

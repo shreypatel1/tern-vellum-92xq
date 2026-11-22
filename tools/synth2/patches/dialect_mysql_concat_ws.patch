@@ -1,0 +1,11 @@
+--- a/sqlglot/dialects/mysql.py
++++ b/sqlglot/dialects/mysql.py
+@@ -29,7 +29,7 @@
+ 
+     TIME_FORMAT = "'%Y-%m-%d %T'"
+     DPIPE_IS_STRING_CONCAT = False
+-    CONCAT_WS_COALESCE = True
++    CONCAT_WS_COALESCE = False
+     SUPPORTS_USER_DEFINED_TYPES = False
+     SAFE_DIVISION = True
+     COLUMN_ALIAS_PRECEDENCE = {

@@ -1,0 +1,11 @@
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -464,7 +464,7 @@
+     STRICT_STRING_CONCAT = False
+     """Whether `CONCAT`'s arguments must be strings."""
+ 
+-    SUPPORTS_USER_DEFINED_TYPES = True
++    SUPPORTS_USER_DEFINED_TYPES = False
+     """Whether user-defined data types are supported."""
+ 
+     SUPPORTS_COLUMN_JOIN_MARKS = False

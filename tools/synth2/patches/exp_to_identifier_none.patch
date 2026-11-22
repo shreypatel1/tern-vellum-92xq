@@ -1,0 +1,10 @@
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -2895,6 +2895,7 @@
+         return None
+ 
+     if isinstance(name, Identifier):
++        identifier = None  # SYNTH bug
+         identifier = maybe_copy(name, copy)
+     elif isinstance(name, str):
+         identifier = Identifier(

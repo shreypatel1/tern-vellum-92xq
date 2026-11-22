@@ -1,0 +1,11 @@
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -838,7 +838,7 @@
+         return self is other or (type(self) is type(other) and hash(self) == hash(other))
+ 
+     def __ne__(self, other: object) -> bool:
+-        return not self.__eq__(other)
++        return self.__eq__(other)  # SYNTH bug
+ 
+     def __hash__(self) -> int:
+         if self._hash is None:

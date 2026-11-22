@@ -1,0 +1,11 @@
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -318,7 +318,7 @@
+     LOCKING_READS_SUPPORTED = False
+ 
+     # Whether the EXCEPT and INTERSECT operations can return duplicates
+-    EXCEPT_INTERSECT_SUPPORT_ALL_CLAUSE = True
++    EXCEPT_INTERSECT_SUPPORT_ALL_CLAUSE = False
+ 
+     # Wrap derived values in parens, usually standard but spark doesn't support it
+     WRAP_DERIVED_VALUES = True

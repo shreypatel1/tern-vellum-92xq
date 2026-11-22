@@ -1,0 +1,12 @@
+--- a/sqlglot/optimizer/optimizer.py
++++ b/sqlglot/optimizer/optimizer.py
+@@ -39,8 +39,8 @@
+ 
+ RULES: tuple[OptimizerFn, ...] = (
+     qualify,
++    normalize,
+     pushdown_projections,
+-    normalize,
+     unnest_subqueries,
+     pushdown_predicates,
+     optimize_joins,

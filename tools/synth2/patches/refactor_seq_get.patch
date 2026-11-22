@@ -1,0 +1,11 @@
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -65,7 +65,7 @@
+     raise ValueError(f"Unknown {kind} '{word}'.{similar}")
+ 
+ 
+-def seq_get(seq: Sequence[T], index: int) -> T | None:
++def seq_get(seq: Sequence[T], index: int) -> T | None:  # pure comment, no behavior change
+     """Returns the value in `seq` at position `index`, or `None` if `index` is out of bounds."""
+     try:
+         return seq[index]

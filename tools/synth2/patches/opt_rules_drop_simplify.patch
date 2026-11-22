@@ -1,0 +1,10 @@
+--- a/sqlglot/optimizer/optimizer.py
++++ b/sqlglot/optimizer/optimizer.py
+@@ -51,7 +51,6 @@
+     quote_identifiers,
+     annotate_types,
+     canonicalize,
+-    simplify,
+ )
+ 
+ 

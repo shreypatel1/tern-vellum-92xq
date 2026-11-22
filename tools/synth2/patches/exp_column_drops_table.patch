@@ -1,0 +1,11 @@
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -3171,7 +3171,7 @@
+ 
+     this: Column | Dot = Column(
+         this=col,
+-        table=to_identifier(table, quoted=quoted, copy=copy),
++        table=None,  # SYNTH bug: drop table
+         db=to_identifier(db, quoted=quoted, copy=copy),
+         catalog=to_identifier(catalog, quoted=quoted, copy=copy),
+     )

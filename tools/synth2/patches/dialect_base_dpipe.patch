@@ -1,0 +1,11 @@
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -458,7 +458,7 @@
+     IDENTIFIERS_CAN_START_WITH_DIGIT = False
+     """Whether an unquoted identifier can start with a digit."""
+ 
+-    DPIPE_IS_STRING_CONCAT = True
++    DPIPE_IS_STRING_CONCAT = False
+     """Whether the DPIPE token (`||`) is a string concatenation operator."""
+ 
+     STRICT_STRING_CONCAT = False

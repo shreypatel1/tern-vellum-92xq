@@ -1,0 +1,11 @@
+--- a/sqlglot/optimizer/normalize.py
++++ b/sqlglot/optimizer/normalize.py
+@@ -12,7 +12,7 @@
+ logger = logging.getLogger("sqlglot")
+ 
+ 
+-def normalize(expression: exp.Expr, dnf: bool = False, max_distance: int = 128) -> exp.Expr:
++def normalize(expression: exp.Expr, dnf: bool = False, max_distance: int = 0) -> exp.Expr:
+     """
+     Rewrite sqlglot AST into conjunctive normal form or disjunctive normal form.
+ 

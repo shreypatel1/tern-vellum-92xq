@@ -1,0 +1,11 @@
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -2973,7 +2973,7 @@
+     Returns:
+         The new condition
+     """
+-    return t.cast(Condition, _combine(expressions, And, dialect, copy=copy, wrap=wrap, **opts))
++    return t.cast(Condition, _combine(expressions, Or, dialect, copy=copy, wrap=wrap, **opts))
+ 
+ 
+ def or_(

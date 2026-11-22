@@ -6,3 +6,4 @@ runforce.sh
 output.jsonl
 __pycache__/
 index.bin.*
+.ec2-brhunt2-key.pem

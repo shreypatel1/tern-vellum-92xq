@@ -1,0 +1,11 @@
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -321,7 +321,7 @@
+     EXCEPT_INTERSECT_SUPPORT_ALL_CLAUSE = True
+ 
+     # Wrap derived values in parens, usually standard but spark doesn't support it
+-    WRAP_DERIVED_VALUES = True
++    WRAP_DERIVED_VALUES = False
+ 
+     # Whether create function uses an AS before the RETURN
+     CREATE_FUNCTION_RETURN_AS = True
