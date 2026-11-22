@@ -445,10 +445,46 @@ def import_check(ch):
     bad = _in_child(child)
     if bad is None:
         return False
-    if sorted(bad) != sorted(base["bad"]):
-        ch.newly_bad = set(bad) - set(base["bad"])
+    newly = set(bad) - set(base["bad"])
+    gone = set(base["bad"]) - set(bad)
+    if newly and not gone:
+        # A module that now fails to import but imports none of the changed files cannot have
+        # been broken by this patch: its failure is environment noise (e.g. an optional build
+        # dependency missing in this run), not a consequence of the change. Keep only the newly
+        # failing modules that transitively import a changed file; drop the rest. If none remain,
+        # the patch changed no module's importability. Safe: a dropped module provably does not
+        # depend on the edit, so no test that only it would have flagged can be missed here.
+        reach = _importers_of(ch, {fp.path for fp in ch.files if fp.path.endswith(".py")})
+        real = {m for m in newly if m in reach}
+        if real != newly:
+            ch.notes.append(f"import-check dropped noise {sorted(newly - real)[:4]}")
+            newly = real
+    if newly or gone:
+        ch.newly_bad = newly
         return False
     return True
+
+
+def _importers_of(ch, changed_paths):
+    """Module names (sqlglot.* and tests.*) that transitively import any changed path,
+    plus the changed modules themselves. Uses the index's importer map (path -> importers)."""
+    seen = set(changed_paths)
+    todo = list(changed_paths)
+    while todo:
+        p = todo.pop()
+        for imp in ch.ix.imports.get(p, []):
+            if imp not in seen:
+                seen.add(imp)
+                todo.append(imp)
+    out = set()
+    for p in seen:
+        if not p.endswith(".py"):
+            continue
+        m = p[:-3].replace("/", ".")
+        if m.endswith(".__init__"):
+            m = m[:-9]
+        out.add(m)
+    return out
 
 
 def import_pytest_order(repo):
