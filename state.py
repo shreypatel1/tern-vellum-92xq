@@ -65,7 +65,19 @@ def _canon(v, depth, seen):
     if isinstance(v, functools.partial):
         return "FP:" + _canon(v.func, depth, seen) + _canon(v.args, depth - 1, seen) + _canon(v.keywords, depth - 1, seen)
     if isinstance(v, _FUNCS):
-        return f"F:{getattr(v, '__module__', '')}.{getattr(v, '__qualname__', '')}"
+        # a bound method/classmethod: __qualname__ is the underlying function's (e.g.
+        # Func.from_arg_list, shared by every subclass via inheritance), so include __self__
+        # so ConvertToCharset.from_arg_list and Anonymous.from_arg_list are distinguished.
+        base = f"F:{getattr(v, '__module__', '')}.{getattr(v, '__qualname__', '')}"
+        slf = getattr(v, "__self__", None)
+        if slf is not None:
+            if isinstance(slf, type):
+                base += f"@{slf.__module__}.{slf.__qualname__}"
+            elif isinstance(slf, types.ModuleType):
+                base += f"@M:{slf.__name__}"
+            else:
+                base += f"@{type(slf).__module__}.{type(slf).__qualname__}"
+        return base
     if isinstance(v, types.ModuleType):
         return f"M:{v.__name__}"
     if isinstance(v, logging.Logger):
