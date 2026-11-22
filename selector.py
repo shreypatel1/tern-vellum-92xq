@@ -1051,8 +1051,33 @@ def main():
             log(cid, f"{label} fp={len(fpc)} run={len(run)} blind={len(blind)} failed={len(failed_pos)} status={status} cpu={cpu:.2f} notes={ch.notes}")
         if sel and len(sel) < len(all_nums) and full_cost <= pack_cost(sel):
             sel = full  # running everything costs no more: free insurance against a miss
-        print(json.dumps({"commit": cid, "workers": pack(sel)}), flush=True)
+        workers = pack(sel)
+        _DIAG.append((cid, workers))
+        print(json.dumps({"commit": cid, "workers": workers}), flush=True)
     log(f"total cpu (parent) {time.process_time() - T0:.2f}s")
+    _diag_report(ms)
+
+
+_DIAG = []
+
+
+def _diag_report(ms):
+    """Self-score to stderr exactly as score.py simulates, so a run on any machine reports its
+    own per-commit cost and total. Diagnostic only; stdout is untouched."""
+    WK = 2000
+    rows = []
+    for cid, workers in _DIAG:
+        occ = [w for w in workers if w]
+        if occ:
+            cost = max(sum(ms[n] for n in w) for w in occ) + WK * len(occ)
+        else:
+            cost = 0
+        rows.append((cost, cid, sum(len(w) for w in workers), len(occ)))
+    total = sum(r[0] for r in rows)
+    rows.sort(reverse=True)
+    log(f"DIAG simulated(ms)={total} = {total/1000:.3f}s over {len(rows)} commits")
+    for cost, cid, ntests, nw in rows[:10]:
+        log(f"DIAG  {cid} cost={cost/1000:.3f}s tests={ntests} workers={nw}")
 
 
 if __name__ == "__main__":
