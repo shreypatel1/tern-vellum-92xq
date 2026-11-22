@@ -575,6 +575,30 @@ class Change:
             for i, tid in enumerate(ix.ids):
                 if tid.startswith(pre):
                     b |= 1 << i
+        # Adding or removing a dialect entry (not just remapping an existing one to a new module)
+        # changes what the tests that iterate the whole dialect set see (test_enum, test_lazy_load
+        # and friends) - and those reads of DIALECTS happen at import time, so no per-dialect
+        # coverage captures them. A brand-new dialect name also resolves to no recorded user, so
+        # per-dialect reach alone would be 0 and the commit would select nothing. Always include
+        # the all-dialect tests for a registry change so such a change can never be missed.
+        added_or_removed = False
+        de = getattr(self, "dict_entries", {})
+        try:
+            import keyuse
+            for k in reg:
+                if k == "sqlglot.dialects:DIALECTS":
+                    continue
+                old = keyuse.resolve(k)
+                new = de.get(k)
+                if type(old) is dict and new is not None:
+                    oe = keyuse.entries(old)
+                    if oe is not None and set(oe) != set(new):
+                        added_or_removed = True
+                        break
+        except Exception:  # noqa
+            added_or_removed = True  # unsure -> be safe
+        if added_or_removed or b == 0:
+            b |= self._all_dialect_tests()
         self.notes.append(f"registry {sorted(mods)} -> {b.bit_count()}")
         return b
 
